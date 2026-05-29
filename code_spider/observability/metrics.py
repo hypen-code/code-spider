@@ -40,6 +40,9 @@ class _MetricsBundle:
     indexer_errors: Counter
     mcp_tool_duration: Histogram
     mcp_tool_errors: Counter
+    schema_count_cache_hits: Counter
+    schema_count_cache_misses: Counter
+    schema_count_cache_invalidations: Counter
 
 
 def _build() -> _MetricsBundle:
@@ -106,6 +109,24 @@ def _build() -> _MetricsBundle:
             "code_spider_mcp_tool_errors_total",
             "MCP tool invocation errors.",
             labelnames=("tool",),
+            registry=reg,
+        ),
+        schema_count_cache_hits=Counter(
+            "code_spider_schema_count_cache_hits_total",
+            "get_graph_schema count-cache hits.",
+            labelnames=("kind",),  # "node" or "rel"
+            registry=reg,
+        ),
+        schema_count_cache_misses=Counter(
+            "code_spider_schema_count_cache_misses_total",
+            "get_graph_schema count-cache misses.",
+            labelnames=("kind",),
+            registry=reg,
+        ),
+        schema_count_cache_invalidations=Counter(
+            "code_spider_schema_count_cache_invalidations_total",
+            "get_graph_schema count-cache invalidations triggered by writes.",
+            labelnames=("trigger",),  # full|delta|delete|manual
             registry=reg,
         ),
     )

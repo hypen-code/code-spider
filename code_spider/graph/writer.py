@@ -28,6 +28,7 @@ from typing import Any
 from neo4j import ManagedTransaction
 
 from code_spider.graph.client import Neo4jClient, retry_on_transient
+from code_spider.graph.count_cache import invalidate_workspace
 from code_spider.logging_setup import get_logger
 from code_spider.symbols.model import (
     Chunk,
@@ -359,6 +360,7 @@ class GraphWriter:
             repo=repo_name,
             count=len(paths),
         )
+        invalidate_workspace(workspace_id, trigger="delete")
 
     @retry_on_transient
     def write_workspace_bundle_delta(
@@ -463,6 +465,7 @@ class GraphWriter:
             workspace=bundle.workspace_id,
             **{k: v for k, v in stats.items() if k not in {"repos", "deletions"}},
         )
+        invalidate_workspace(bundle.workspace_id, trigger="delta")
         return stats
 
     @retry_on_transient
@@ -558,6 +561,7 @@ class GraphWriter:
             workspace=bundle.workspace_id,
             **{k: v for k, v in stats.items() if k != "repos"},
         )
+        invalidate_workspace(bundle.workspace_id, trigger="full")
         return stats
 
     # --------------------------------------------------------- repo writes

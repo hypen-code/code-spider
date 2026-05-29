@@ -100,6 +100,9 @@ ignore = [
 "code_spider/indexer.py" = ["PLR0915"]
 # Module-level singleton for the MCP server context is intentional.
 "code_spider/mcp/context.py" = ["PLW0603"]
+# Process-wide count-cache singleton lets the writer invalidate without
+# threading a handle through every call site.
+"code_spider/graph/count_cache.py" = ["PLW0603"]
 
 [tool.mypy]
 python_version = "3.13"

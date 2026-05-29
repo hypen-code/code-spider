@@ -15,6 +15,7 @@ import re
 from dataclasses import dataclass
 from typing import Any, Literal
 
+from code_spider.graph.count_cache import CountEntry, get_cache
 from code_spider.mcp.auth import (
     assert_safe_workspace_id,
     audited,
@@ -255,6 +256,7 @@ _GUIDANCE: tuple[str, ...] = (
 def get_graph_schema(
     workspace_id: str | None = None,
     include_counts: bool = True,
+    force_refresh: bool = False,
 ) -> dict[str, Any]:
     """Return the Neo4j schema (labels, rels, properties, indexes, constraints).
 
@@ -267,6 +269,10 @@ def get_graph_schema(
             when ``None``). Rels are scoped via the start node.
         include_counts: Pass ``False`` to skip per-label/per-rel counts
             (~7x faster, ~half the payload).
+        force_refresh: Bypass the in-process count cache for this call.
+            Use sparingly — the cache is invalidated automatically on
+            every index/incremental write, so stale data is normally
+            bounded to the TTL window only when writes happen out-of-process.
 
     Returns:
         ``{node_labels, relationship_types, indexes, constraints,
@@ -277,6 +283,7 @@ def get_graph_schema(
         assert_safe_workspace_id(workspace_id)
 
     ctx = get_context()
+    cache = get_cache()
     with read_session(ctx.neo4j) as session:
         # 1. Property catalogues.
         node_prop_rows = [dict(r) for r in session.run(_NODE_TYPE_PROPS)]
@@ -299,6 +306,9 @@ def get_graph_schema(
         # 4. Counts (optional). Per-label scope: if a label/rel type does
         # not expose ``workspace_id`` (e.g. the ``Workspace`` node itself),
         # we fall back to a global count rather than returning ``0``.
+        # Each count is fetched through the in-process TTL cache so a
+        # burst of schema calls (typical when an LLM iteratively probes
+        # execute_cypher) costs one round-trip per label instead of N.
         node_counts: dict[str, _Count] = {}
         rel_counts: dict[str, _Count] = {}
         if include_counts:
@@ -307,29 +317,61 @@ def get_graph_schema(
                     continue
                 has_ws = any(p["name"] == "workspace_id" for p in props)
                 scoped = bool(workspace_id) and has_ws
-                row = session.run(
-                    _node_count_query(label, scoped=scoped),
-                    parameters=({"workspace_id": workspace_id} if scoped else {}),
-                ).single()
-                node_counts[label] = _Count(
-                    value=int(row["c"]) if row else 0,
-                    scope="workspace" if scoped else "global",
+
+                def _fetch_node_count(
+                    _label: str = label, _scoped: bool = scoped
+                ) -> CountEntry:
+                    row = session.run(
+                        _node_count_query(_label, scoped=_scoped),
+                        parameters=(
+                            {"workspace_id": workspace_id} if _scoped else {}
+                        ),
+                    ).single()
+                    return CountEntry(
+                        value=int(row["c"]) if row else 0,
+                        scope="workspace" if _scoped else "global",
+                    )
+
+                entry = cache.get_or_compute(
+                    workspace_id=workspace_id,
+                    kind="node",
+                    name=label,
+                    scoped=scoped,
+                    fetch=_fetch_node_count,
+                    force_refresh=force_refresh,
                 )
+                node_counts[label] = _Count(value=entry.value, scope=entry.scope)
             for rt in rel_props:
                 if not _SAFE_LABEL_OR_REL.fullmatch(rt):
                     continue
                 # We can always scope on the start node's workspace_id when
                 # the caller supplied one; rel-type property catalogue is
                 # not consulted because the scope lives on the *node*.
-                scoped = bool(workspace_id)
-                row = session.run(
-                    _rel_count_query(rt, scoped=scoped),
-                    parameters=({"workspace_id": workspace_id} if scoped else {}),
-                ).single()
-                rel_counts[rt] = _Count(
-                    value=int(row["c"]) if row else 0,
-                    scope="workspace" if scoped else "global",
+                scoped_rel = bool(workspace_id)
+
+                def _fetch_rel_count(
+                    _rt: str = rt, _scoped: bool = scoped_rel
+                ) -> CountEntry:
+                    row = session.run(
+                        _rel_count_query(_rt, scoped=_scoped),
+                        parameters=(
+                            {"workspace_id": workspace_id} if _scoped else {}
+                        ),
+                    ).single()
+                    return CountEntry(
+                        value=int(row["c"]) if row else 0,
+                        scope="workspace" if _scoped else "global",
+                    )
+
+                entry = cache.get_or_compute(
+                    workspace_id=workspace_id,
+                    kind="rel",
+                    name=rt,
+                    scoped=scoped_rel,
+                    fetch=_fetch_rel_count,
+                    force_refresh=force_refresh,
                 )
+                rel_counts[rt] = _Count(value=entry.value, scope=entry.scope)
 
     # 5. Compose the response.
     def _node_count_payload(label: str) -> dict[str, Any] | None:

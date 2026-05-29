@@ -9,6 +9,7 @@ injection-proof label / rel-type guards on the count queries.
 from __future__ import annotations
 
 import importlib
+import inspect
 from typing import Any
 
 import pytest
@@ -274,3 +275,20 @@ class TestCountQuerySafety:
     def test_rel_count_rejects_unsafe_types(self, bad: str) -> None:
         with pytest.raises(ValueError, match="unsafe relationship type"):
             _rel_count_query(bad, scoped=True)
+
+
+# --------------------------------------------------------------------------- #
+# Public tool signature                                                       #
+# --------------------------------------------------------------------------- #
+
+
+class TestPublicSignature:
+    def test_accepts_force_refresh_kwarg(self) -> None:
+        """``force_refresh`` is the documented cache-bypass knob."""
+        sig = inspect.signature(gs_mod.get_graph_schema)
+        params = sig.parameters
+        assert "force_refresh" in params
+        assert params["force_refresh"].default is False
+        # ``workspace_id`` and ``include_counts`` stay backward-compatible.
+        assert params["workspace_id"].default is None
+        assert params["include_counts"].default is True

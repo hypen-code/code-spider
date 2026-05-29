@@ -33,6 +33,11 @@ _log = get_logger("code_spider.mcp.audit")
 # Identifiers we are willing to interpolate into MERGE/MATCH parameters.
 _SAFE_IDENT = re.compile(r"^[A-Za-z0-9_\.\-:/@*\{\}]+$")
 _SAFE_WORKSPACE_ID = re.compile(r"^[a-z0-9][a-z0-9_\-]*$")
+# Search text (fuzzy / fulltext) is bound as a Cypher parameter (never
+# interpolated) and Lucene-escaped before being sent to the fulltext
+# procedure, so we can safely accept whitespace and a wider character
+# class than ``_SAFE_IDENT``. Control characters are still rejected.
+_SAFE_SEARCH_TEXT = re.compile(r"^[^\x00-\x1f\x7f]+$")
 
 
 def assert_safe_workspace_id(value: str) -> str:
@@ -44,6 +49,20 @@ def assert_safe_workspace_id(value: str) -> str:
 def assert_safe_identifier(value: str, *, max_len: int = 512) -> str:
     if not value or len(value) > max_len or not _SAFE_IDENT.fullmatch(value):
         raise ValueError(f"invalid identifier value: {value!r}")
+    return value
+
+
+def assert_safe_search_text(value: str, *, max_len: int = 256) -> str:
+    """Validate a free-form search phrase for fuzzy/fulltext queries.
+
+    Permits whitespace and most printable characters, but rejects empty
+    strings, control characters and anything over ``max_len``. The result
+    is always passed through Lucene escaping before reaching Neo4j, so the
+    only attack surface is denial-of-service via gigantic inputs — which
+    the length cap addresses.
+    """
+    if not value or len(value) > max_len or not _SAFE_SEARCH_TEXT.fullmatch(value):
+        raise ValueError(f"invalid search text: {value!r}")
     return value
 
 
