@@ -33,6 +33,15 @@ def lexical_search(
     """
     if not query.strip():
         return []
+    # Pass Cypher parameters via the explicit ``parameters=`` dict. Using
+    # ``query=query`` as a kwparameter collides with ``Session.run(query, ...)``
+    # itself, which raises in neo4j-driver >=6.0 ("argument 'query' conflicts
+    # with the Cypher statement parameter").
+    params = {
+        "workspace_id": workspace_id,
+        "query": query,
+        "limit": limit,
+    }
     with client.session() as session:
         result = session.run(
             """
@@ -52,9 +61,7 @@ def lexical_search(
             ORDER BY score DESC
             LIMIT $limit
             """,
-            workspace_id=workspace_id,
-            query=query,
-            limit=limit,
+            parameters=params,
         )
         return [
             LexicalHit(

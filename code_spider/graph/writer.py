@@ -943,4 +943,7 @@ def _chunks(items: Iterable[dict[str, Any]], size: int) -> Iterator[list[dict[st
 
 
 def _run_unit(tx: ManagedTransaction, *, query: str, params: dict[str, Any]) -> None:
-    tx.run(query, **params).consume()
+    # Pass through the explicit ``parameters=`` dict rather than ``**params`` so
+    # a payload key named ``query`` / ``parameters`` cannot collide with the
+    # driver signature ``tx.run(query, parameters=None, **kwparameters)``.
+    tx.run(query, parameters=params).consume()

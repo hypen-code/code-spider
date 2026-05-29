@@ -12,19 +12,23 @@ from code_spider.mcp.auth import (
 )
 from code_spider.mcp.context import get_context
 
+# NOTE: ``c1`` and ``c2`` are *relationship lists* bound by the variable-length
+# pattern ``-[var:CALLS*1..N]->``. In Cypher, ``length()`` only accepts a Path;
+# for a list of relationships you must use ``size()``. Using ``length()`` here
+# raised: "Type mismatch: expected Path but was List<Relationship>".
 _QUERY = """
 MATCH (target:Symbol {workspace_id: $workspace_id, fqn: $fqn})
 OPTIONAL MATCH (caller:Symbol)-[c1:CALLS*1..%(depth)d]->(target)
 WITH target, collect(DISTINCT {fqn: caller.fqn, repo: caller.repo,
        file_path: caller.file_path, start_line: caller.start_line,
-       hops: length(c1),
+       hops: size(c1),
        min_confidence: reduce(m = 1.0, r IN c1 | CASE WHEN r.confidence IS NULL
          THEN m ELSE (CASE WHEN r.confidence < m THEN r.confidence ELSE m END) END)
 }) AS callers
 OPTIONAL MATCH (target)-[c2:CALLS*1..%(depth)d]->(callee:Symbol)
 WITH target, callers, collect(DISTINCT {fqn: callee.fqn, repo: callee.repo,
        file_path: callee.file_path, start_line: callee.start_line,
-       hops: length(c2),
+       hops: size(c2),
        min_confidence: reduce(m = 1.0, r IN c2 | CASE WHEN r.confidence IS NULL
          THEN m ELSE (CASE WHEN r.confidence < m THEN r.confidence ELSE m END) END)
 }) AS callees
