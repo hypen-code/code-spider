@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "code-spider"
-version = "0.1.0"
+version = "0.1.1"
 description = "Centralized codebase knowledge graph + coordinate index for AI coding agents (Neo4j-backed)."
 readme = "README.md"
 requires-python = ">=3.12"
