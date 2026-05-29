@@ -1,9 +1,12 @@
 """``code-spider`` command-line entry point.
 
 Subcommands:
-    migrate       Apply Neo4j constraints + indexes.
-    index         Index one or more repos in a workspace.
-    serve         Start the MCP server (Phase 1+ — currently a stub).
+    configure     Interactive wizard to point the CLI at a central Neo4j.
+    doctor        Verify config + bolt connection + schema end-to-end.
+    mcp-config    Print a copy-pasteable MCP server JSON snippet.
+    migrate       Apply Neo4j constraints + indexes (admin / central server).
+    index         Index one or more repos in a workspace (admin / CI).
+    serve         Start the MCP server (JSON-RPC over stdio) for an agent.
 """
 
 from __future__ import annotations
@@ -172,6 +175,90 @@ def serve(
     from code_spider.mcp.server import run_stdio
 
     run_stdio(settings=settings, embed_provider=embed)
+
+
+@app.command()
+def configure(
+    uri: str | None = typer.Option(None, "--uri", help="Neo4j bolt URI (skips the prompt)."),
+    user: str | None = typer.Option(None, "--user", help="Neo4j username (skips the prompt)."),
+    password: str | None = typer.Option(
+        None,
+        "--password",
+        help="Neo4j password (skips the prompt). Required in --non-interactive mode.",
+    ),
+    database: str | None = typer.Option(
+        None, "--database", help="Neo4j database name (skips the prompt)."
+    ),
+    non_interactive: bool = typer.Option(
+        False,
+        "--non-interactive",
+        "-y",
+        help="Do not prompt; use flags + existing config only. Useful in CI / scripts.",
+    ),
+    skip_test: bool = typer.Option(
+        False, "--skip-test", help="Don't probe the bolt connection before saving."
+    ),
+    config_path: Path | None = typer.Option(
+        None, "--config-path", help="Write to this file instead of the default user config."
+    ),
+) -> None:
+    """Interactive wizard: point ``code-spider`` at a central Neo4j and save creds."""
+    from code_spider.onboarding import run_configure
+
+    code = run_configure(
+        console=console,
+        non_interactive=non_interactive,
+        uri=uri,
+        user=user,
+        password=password,
+        database=database,
+        skip_test=skip_test,
+        config_path=config_path,
+    )
+    if code != 0:
+        raise typer.Exit(code=code)
+
+
+@app.command("mcp-config")
+def mcp_config(
+    agent: str = typer.Option(
+        "windsurf",
+        "--agent",
+        "-a",
+        help="Target agent: windsurf | cursor | claude-code | generic.",
+    ),
+    include_password: bool = typer.Option(
+        False,
+        "--include-password",
+        help="Embed the saved password into the JSON (default: placeholder).",
+    ),
+    command: str | None = typer.Option(
+        None,
+        "--command",
+        help="Override the `command` field (default: absolute path of installed code-spider).",
+    ),
+) -> None:
+    """Print a copy-pasteable MCP server JSON snippet for the chosen agent."""
+    from code_spider.onboarding import run_mcp_config
+
+    code = run_mcp_config(
+        console=console,
+        agent=agent,
+        include_password=include_password,
+        command_override=command,
+    )
+    if code != 0:
+        raise typer.Exit(code=code)
+
+
+@app.command()
+def doctor() -> None:
+    """Verify env → bolt → auth → schema. Run this after ``configure``."""
+    from code_spider.onboarding import run_doctor
+
+    code = run_doctor(console=console)
+    if code != 0:
+        raise typer.Exit(code=code)
 
 
 if __name__ == "__main__":  # pragma: no cover

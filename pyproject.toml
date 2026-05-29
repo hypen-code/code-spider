@@ -7,7 +7,7 @@ name = "code-spider"
 version = "0.1.0"
 description = "Centralized codebase knowledge graph + coordinate index for AI coding agents (Neo4j-backed)."
 readme = "README.md"
-requires-python = ">=3.13"
+requires-python = ">=3.12"
 license = { text = "Apache-2.0" }
 authors = [{ name = "Code Spider Authors" }]
 keywords = ["knowledge-graph", "code-intelligence", "neo4j", "tree-sitter", "mcp", "ai-agents"]
@@ -15,8 +15,11 @@ classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
     "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: Software Development :: Code Generators",
+    "License :: OSI Approved :: Apache Software License",
 ]
 
 dependencies = [
@@ -59,15 +62,15 @@ all = [
 code-spider = "code_spider.cli:app"
 
 [project.urls]
-Homepage = "https://github.com/codelab/code-spider"
-Issues = "https://github.com/codelab/code-spider/issues"
+Homepage = "https://github.com/hypen-code/code-spider"
+Issues = "https://github.com/hypen-code/code-spider/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = ["code_spider"]
 
 [tool.ruff]
 line-length = 100
-target-version = "py313"
+target-version = "py312"
 
 [tool.ruff.lint]
 select = [
@@ -103,9 +106,13 @@ ignore = [
 # Process-wide count-cache singleton lets the writer invalidate without
 # threading a handle through every call site.
 "code_spider/graph/count_cache.py" = ["PLW0603"]
+# Onboarding deliberately uses function-local imports so that `--help`, the
+# `configure` wizard, and `mcp-config` (no Neo4j needed) stay cheap and never
+# pull in the graph driver / mcp SDK on cold start.
+"code_spider/onboarding.py" = ["PLC0415"]
 
 [tool.mypy]
-python_version = "3.13"
+python_version = "3.12"
 strict = true
 warn_unreachable = true
 warn_redundant_casts = true

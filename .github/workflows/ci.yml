@@ -1,0 +1,114 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint-and-test:
+    name: lint + unit tests (py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install package + dev deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Ruff lint
+        run: ruff check .
+
+      - name: Ruff format check
+        # Non-blocking until the rest of the tree is reformatted.
+        run: ruff format --check . || echo "::warning::ruff format drift (non-blocking)"
+
+      - name: Pytest (unit tests only — integration needs a live Neo4j)
+        run: pytest -q
+
+  integration:
+    name: integration tests (live Neo4j)
+    runs-on: ubuntu-latest
+    services:
+      neo4j:
+        image: neo4j:5.24-community
+        env:
+          NEO4J_AUTH: neo4j/codespider-dev-password
+          NEO4J_PLUGINS: '["apoc"]'
+          NEO4J_dbms_security_procedures_unrestricted: "apoc.*,gds.*"
+        ports:
+          - 7687:7687
+          - 7474:7474
+        options: >-
+          --health-cmd "wget --quiet --tries=1 --spider http://localhost:7474 || exit 1"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 20
+          --health-start-period 30s
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install package
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Wait for Neo4j to become ready
+        env:
+          CODE_SPIDER_NEO4J_URI: bolt://localhost:7687
+          CODE_SPIDER_NEO4J_USER: neo4j
+          CODE_SPIDER_NEO4J_PASSWORD: codespider-dev-password
+          CODE_SPIDER_NEO4J_DATABASE: neo4j
+        run: |
+          for i in $(seq 1 30); do
+            if code-spider doctor >/dev/null 2>&1; then
+              echo "Neo4j ready after ${i} attempts."
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "Neo4j never became ready."
+          code-spider doctor || true
+          exit 1
+
+      - name: Migrate schema
+        env:
+          CODE_SPIDER_NEO4J_URI: bolt://localhost:7687
+          CODE_SPIDER_NEO4J_USER: neo4j
+          CODE_SPIDER_NEO4J_PASSWORD: codespider-dev-password
+          CODE_SPIDER_NEO4J_DATABASE: neo4j
+        run: code-spider migrate
+
+      - name: Run integration tests
+        env:
+          CODE_SPIDER_NEO4J_URI: bolt://localhost:7687
+          CODE_SPIDER_NEO4J_USER: neo4j
+          CODE_SPIDER_NEO4J_PASSWORD: codespider-dev-password
+          CODE_SPIDER_NEO4J_DATABASE: neo4j
+        run: pytest -q -m integration

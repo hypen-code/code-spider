@@ -3,10 +3,17 @@
 All settings can be overridden by `CODE_SPIDER_*` environment variables.
 Use :func:`load_settings` at the entry point; pass the returned ``Settings`` down.
 
-A ``.env`` file at the current working directory (or the project root above it)
-is auto-loaded if present. Real environment variables always take precedence,
-so CI/CD and one-off `CODE_SPIDER_FOO=... code-spider ...` invocations still
-override the file.
+Two dotenv files are auto-loaded at import time (in order of decreasing
+precedence — earlier wins, real env vars always win over both):
+
+1. ``./.env`` at the current working directory (developer-friendly, project-local).
+2. The user-global file at ``$CODE_SPIDER_CONFIG_FILE`` or, by default,
+   ``$XDG_CONFIG_HOME/code-spider/config.env`` (falling back to
+   ``~/.config/code-spider/config.env``).
+
+The user-global path is what ``code-spider configure`` writes to, so that a
+``pip install code-spider`` user can run ``code-spider serve`` from any
+directory without copying a ``.env``.
 """
 
 from __future__ import annotations
@@ -17,9 +24,31 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-# Load ``.env`` once at import time. ``override=False`` means an already-set
-# real env var wins — important so CI secrets and ad-hoc overrides keep working.
-load_dotenv(override=False)
+
+def user_config_path() -> Path:
+    """Return the user-global config-env path (does not have to exist)."""
+    override = os.environ.get("CODE_SPIDER_CONFIG_FILE")
+    if override:
+        return Path(override).expanduser()
+    xdg = os.environ.get("XDG_CONFIG_HOME")
+    base = Path(xdg).expanduser() if xdg else Path.home() / ".config"
+    return base / "code-spider" / "config.env"
+
+
+def _load_dotenv_layers() -> None:
+    """Load CWD ``.env`` first (wins), then the user-global config file.
+
+    ``override=False`` everywhere means an already-set real env var keeps
+    winning, and the CWD ``.env`` wins over the user-global file (because it
+    is loaded first).
+    """
+    load_dotenv(override=False)  # CWD/.env (and parent dirs via dotenv's search)
+    user_path = user_config_path()
+    if user_path.is_file():
+        load_dotenv(dotenv_path=user_path, override=False)
+
+
+_load_dotenv_layers()
 
 
 def _env(name: str, default: str | None = None) -> str | None:

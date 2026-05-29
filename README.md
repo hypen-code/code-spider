@@ -50,21 +50,57 @@ workspaces.yaml --> CI indexer ----> Neo4j 5.x Community
 | Embedding model | Local `sentence-transformers` in-process |
 | Snippet retrieval | Indexer-managed shared filesystem keyed by commit SHA |
 
-## Quickstart (Phase 0)
+## Quickstart for developers (consume an existing central graph)
 
-### 1. Start a local Neo4j Community
+If your team already runs a central Neo4j with the graph indexed, this is all
+you need. No Docker, no local Neo4j, no indexing.
+
+```bash
+# 1. Install (requires Python 3.12+)
+pip install code-spider              # or: pipx install code-spider
+# or zero-install with uv:           uvx code-spider serve
+
+# 2. Point it at the central Neo4j
+code-spider configure                # interactive wizard, saves to
+                                     # ~/.config/code-spider/config.env (0600)
+
+# 3. Verify the connection end-to-end
+code-spider doctor                   # checks env -> bolt -> auth -> schema
+
+# 4. Print the MCP JSON snippet for your coding agent
+code-spider mcp-config --agent windsurf       # or: cursor | claude-code | generic
+# Paste the printed JSON into the path the wizard tells you about.
+```
+
+That's it — restart your agent and the `code-spider` MCP server is wired in.
+
+### Supported coding agents
+
+| Agent | Where to paste the `mcp-config` output |
+|---|---|
+| Windsurf | `~/.codeium/windsurf/mcp_config.json` |
+| Cursor | `~/.cursor/mcp.json` (or project-level `.cursor/mcp.json`) |
+| Claude Code | `claude mcp add-json code-spider '<inner object>'` |
+| Generic | Any MCP client that consumes the standard JSON schema |
+
+## Quickstart for admins (run the central server)
+
+This is the side that operates Neo4j, defines `workspaces.yaml`, and indexes
+repos in CI on every merge to `main`.
+
+### 1. Start Neo4j Community
 
 ```bash
 docker compose up -d neo4j
 # Browser: http://localhost:7474  (neo4j / codespider-dev-password)
 ```
 
-### 2. Install in editable mode
+### 2. Install with dev extras
 
 ```bash
-python3.13 -m venv .venv
+python3.12 -m venv .venv
 source .venv/bin/activate
-pip install -e ".[dev]"
+pip install -e ".[dev,embedding]"
 ```
 
 ### 3. Deploy graph schema
@@ -73,11 +109,11 @@ pip install -e ".[dev]"
 code-spider migrate
 ```
 
-### 4. Index a Python repo
+### 4. Index repositories
 
 ```bash
 cp workspaces.example.yaml workspaces.yaml
-# edit workspaces.yaml to point at a real repo (path or git URL)
+# edit workspaces.yaml to point at real repos (path or git URL)
 code-spider index --workspace demo
 ```
 
@@ -88,40 +124,46 @@ code-spider index --workspace demo
 MATCH (s:Symbol) RETURN s.kind, count(*) AS n ORDER BY n DESC;
 ```
 
-### 6. How to drive it
+### 6. Production indexing options
+
 ```bash
-# Full Phase 1 indexing run with embeddings + metrics
-code-spider migrate
+# Full run with embeddings + Prometheus metrics
 code-spider index --workspace demo --embed sentence-transformers --metrics-port 9464
 
-# Phase 2 incremental on subsequent runs (skip unchanged files)
+# Incremental on subsequent CI runs (skip unchanged files)
 code-spider index --workspace demo --incremental --embed auto
 
-# MCP server (stdio JSON-RPC) for agent consumption
-code-spider serve
-
-# Prometheus metrics (when --metrics-port supplied)
+# Prometheus scraping
 curl http://localhost:9464/metrics | grep code_spider_
 ```
 
-### 7. MCP server
+### 7. Recommended security model for developers
+
+Create a read-only Neo4j user for developers so a leaked password can't
+mutate the graph:
+
+```cypher
+// run as the admin user in Neo4j Browser
+CREATE USER codespider_ro SET PASSWORD 'rotate-me' CHANGE NOT REQUIRED;
+GRANT ROLE reader TO codespider_ro;
+```
+
+Hand `codespider_ro` (not the admin user) to developers running
+`code-spider configure`.
+
+### 8. Hand-rolled MCP JSON (if you don't want to use `mcp-config`)
 
 ```json
 {
   "mcpServers": {
     "code-spider": {
-      "command": "~/code-spider/.venv/bin/code-spider",
-      "args": ["serve", "--embed", "auto"],
-      "cwd": "~/code-spider",
+      "command": "/absolute/path/to/code-spider",
+      "args": ["serve"],
       "env": {
-        "CODE_SPIDER_NEO4J_URI": "bolt://localhost:7687",
-        "CODE_SPIDER_NEO4J_USER": "neo4j",
-        "CODE_SPIDER_NEO4J_PASSWORD": "password",
-        "CODE_SPIDER_NEO4J_DATABASE": "neo4j",
-        "CODE_SPIDER_MANIFEST_PATH": "~/code-spider/workspaces.yaml",
-        "CODE_SPIDER_CHECKOUT_ROOT": "~/code-spider/checkouts",
-        "CODE_SPIDER_LOG_LEVEL": "INFO",
-        "CODE_SPIDER_LOG_JSON": "1"
+        "CODE_SPIDER_NEO4J_URI": "bolt://central-neo4j.example.com:7687",
+        "CODE_SPIDER_NEO4J_USER": "codespider_ro",
+        "CODE_SPIDER_NEO4J_PASSWORD": "rotate-me",
+        "CODE_SPIDER_NEO4J_DATABASE": "neo4j"
       }
     }
   }
@@ -132,7 +174,8 @@ curl http://localhost:9464/metrics | grep code_spider_
 
 ```
 code_spider/
-├── config.py             # env + manifest loading
+├── config.py             # env + manifest loading (CWD .env + ~/.config/code-spider/config.env)
+├── onboarding.py         # `configure` wizard, `mcp-config`, `doctor`
 ├── workspace/manifest.py # YAML schema + diff
 ├── checkout/git.py       # GitPython wrapper
 ├── parser/               # tree-sitter language adapters
@@ -145,7 +188,7 @@ code_spider/
 ├── graph/                # Neo4j client, schema, writer, vector backends
 ├── search/               # lexical + vector + RRF fusion (Phase 1)
 ├── mcp/                  # MCP server + 8 tools (Phase 1)
-└── cli.py                # `code-spider migrate|index|serve`
+└── cli.py                # `code-spider configure|doctor|mcp-config|migrate|index|serve`
 ```
 
 ## Development
