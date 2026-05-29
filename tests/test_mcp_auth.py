@@ -88,7 +88,7 @@ def test_audited_decorator_times_out_slow_tool(
         time.sleep(5)
         return 1
 
-    with pytest.raises(TimeoutError, match="slow timed out after 0.05s"):
+    with pytest.raises(TimeoutError, match=r"slow timed out after 0\.05s"):
         slow_tool()
 
 

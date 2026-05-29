@@ -31,7 +31,7 @@ RETURN w.id AS id, w.name AS name, w.manifest_sha AS manifest_sha,
 
 # Per-label counts are run as separate, index-friendly queries rather than one
 # mega-query with six OPTIONAL MATCH + count(DISTINCT) clauses. The old single
-# query built a cartesian product of every Symbol × Route × Chunk × … which
+# query built a cartesian product of every Symbol x Route x Chunk x ... which
 # materialised millions of intermediate rows and routinely blew the tool
 # timeout. Each entry maps the output key to the node label it counts; all
 # carry a ``workspace_id`` property so the count is workspace-scoped.

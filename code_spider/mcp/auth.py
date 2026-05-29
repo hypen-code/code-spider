@@ -18,7 +18,8 @@ from __future__ import annotations
 import re
 import time
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FuturesTimeoutError
 from functools import wraps
 from typing import Any, TypeVar
 
@@ -58,10 +59,10 @@ def _resolve_tool_timeout_s(setting_attr: str = "tool_timeout_s") -> float:
     tools invoked directly from unit tests — so the decorator never hard-fails.
     """
     try:
-        from code_spider.mcp.context import get_context
+        from code_spider.mcp.context import get_context  # noqa: PLC0415 — avoid import cycle
 
         return float(getattr(get_context().settings, setting_attr))
-    except Exception:  # noqa: BLE001 — context optional outside the server
+    except Exception:
         return _TIMEOUT_FALLBACKS.get(setting_attr, _DEFAULT_TOOL_TIMEOUT_S)
 
 
