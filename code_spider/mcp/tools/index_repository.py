@@ -26,6 +26,18 @@ def index_repository(
 ) -> dict[str, Any]:
     """Trigger a full indexing run for ``workspace_id`` (optionally one repo).
 
+    ⚠️ HUMAN-APPROVAL REQUIRED — this is a heavy, mutating, minutes-long
+    operation (clones repos, re-parses every file, re-embeds chunks, writes to
+    the shared graph). Strict invocation rules:
+
+    1. ALWAYS ask the user for explicit confirmation BEFORE calling this tool,
+       stating the ``workspace_id`` (and ``repo`` if scoped) you intend to
+       reindex.
+    2. If the user declines or does not clearly approve, DO NOT call this tool —
+       gracefully drop the request and continue without erroring.
+    3. NEVER initiate this tool under auto-approval / autonomous / unattended
+       modes. It must only run after a deliberate, in-the-loop human "yes".
+
     Returns the same stats dict as ``code-spider index``.
     """
     assert_safe_workspace_id(workspace_id)
