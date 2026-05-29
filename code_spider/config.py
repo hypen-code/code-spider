@@ -24,6 +24,20 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
+#: Default ceiling for per-input embedding text in characters. Tuned just
+#: below the 131_072-char cap shared by Voyage / Qwen-3 / OpenAI's larger
+#: context models so we leave ~10 KB of safety overhead.
+_DEFAULT_MAX_INPUT_CHARS = 120_000
+
+#: Default ceiling for files we even attempt to parse / chunk / embed.
+#: Files bigger than this are almost always auto-generated assets (minified
+#: bundles, vendored libraries, lockfiles, JSON dumps, package manifests)
+#: whose semantic value for code intelligence is near zero, and whose chunks
+#: blow up the embedding bill and memory budget. 1 MiB strikes a balance:
+#: long enough to keep all real source files; short enough to keep the
+#: indexer well under 4 GiB peak resident on a typical small CI runner.
+_DEFAULT_MAX_FILE_BYTES = 1_048_576  # 1 MiB
+
 
 def user_config_path() -> Path:
     """Return the user-global config-env path (does not have to exist)."""
@@ -99,6 +113,14 @@ class EmbeddingSettings:
     # single huge auto-generated or minified file can't crash the whole
     # workspace embed. Override with ``CODE_SPIDER_EMBED_MAX_INPUT_CHARS``.
     max_input_chars: int
+    # Number of concurrent embedding sub-batches dispatched per repo. The
+    # embedding stage is I/O-bound (network calls to the provider), so a
+    # thread pool — not a process pool — is the right primitive. The default
+    # is ``min(os.cpu_count() or 2, 4)``: enough parallelism to saturate a
+    # modest upstream rate budget without thrashing free-tier providers, and
+    # well-sized for the 2 vCPU / 4 GiB target box. Override with
+    # ``CODE_SPIDER_EMBED_WORKERS``.
+    workers: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -109,6 +131,10 @@ class Settings:
     checkout_root: Path
     log_level: str
     log_json: bool
+    # Hard ceiling on file size considered for parse/chunk/embed. Files
+    # larger than this are skipped at the walker with a counter + warning.
+    # See ``_DEFAULT_MAX_FILE_BYTES`` for the rationale.
+    max_file_bytes: int
 
 
 # ---- Embedding env loader ------------------------------------------------- #
@@ -152,10 +178,21 @@ def _load_embedding_settings() -> EmbeddingSettings:
         api_key=_env("EMBED_API_KEY"),
         timeout_s=_env_float("EMBED_TIMEOUT_S", 30.0),
         max_retries=_env_int("EMBED_MAX_RETRIES", 3),
-        # 120_000 < the 131_072 cap shared by Voyage / Qwen-3 / most modern
-        # embedding endpoints; leaves ~10k headroom for safety overhead.
-        max_input_chars=_env_int("EMBED_MAX_INPUT_CHARS", 120_000),
+        max_input_chars=_env_int("EMBED_MAX_INPUT_CHARS", _DEFAULT_MAX_INPUT_CHARS),
+        workers=_env_int("EMBED_WORKERS", _default_workers()),
     )
+
+
+def _default_workers() -> int:
+    """Default embedding concurrency: ``min(cpu_count, 4)`` (min 1).
+
+    Capped at 4 so we don't hammer free-tier embedding endpoints on bigger
+    boxes; tunable via ``CODE_SPIDER_EMBED_WORKERS``. We pick 4 (not 8) as
+    the upper bound because the 2-vCPU / 4 GiB target box can't usefully
+    parallelise further, and most free-tier API quotas top out around there.
+    """
+    cpu = os.cpu_count() or 2
+    return max(1, min(cpu, 4))
 
 
 def load_settings() -> Settings:
@@ -173,4 +210,5 @@ def load_settings() -> Settings:
         checkout_root=Path(_env_required("CHECKOUT_ROOT", "./checkouts")).resolve(),
         log_level=_env_required("LOG_LEVEL", "INFO").upper(),
         log_json=_env("LOG_JSON", "0") in {"1", "true", "True", "yes"},
+        max_file_bytes=_env_int("MAX_FILE_BYTES", _DEFAULT_MAX_FILE_BYTES),
     )

@@ -182,6 +182,37 @@ vectors from one model can't be compared to vectors from another).
 Precedence: an explicit `--embed <name>` flag always wins; `--embed auto`
 (the default) reads `CODE_SPIDER_EMBED_PROVIDER`.
 
+### 6b. Resource tuning (4 GiB / 2 vCPU and bigger boxes)
+
+The indexer is engineered to run on small CI workers without OOM kills.
+Three knobs control the trade-off between speed and memory:
+
+| Env var | Default | What it does |
+|---|---|---|
+| `CODE_SPIDER_MAX_FILE_BYTES` | `1048576` (1 MiB) | **Skip files larger than this** at the walker, before they are even read. Auto-generated bundles, minified assets, vendored libraries, and lockfiles are almost always over 1 MiB and have near-zero semantic value for code intelligence. Set to `0` to disable. |
+| `CODE_SPIDER_EMBED_BATCH_SIZE` | `64` | Inputs per outbound embedding call. Lower → smaller request bodies (helps under gateway caps) but more roundtrips. |
+| `CODE_SPIDER_EMBED_WORKERS` | `min(cpu_count, 4)` | Number of concurrent embedding sub-batches dispatched per repo. Threaded — fine on 2 vCPUs because embedding is I/O-bound. Lower this if you're hitting upstream rate limits. |
+| `CODE_SPIDER_EMBED_MAX_INPUT_CHARS` | `120000` | Per-input character cap. Anything longer is pre-truncated before being sent. Set well below your model's context window (e.g. `2000` for `all-MiniLM-L6-v2`) to keep the request body small. |
+
+**4 GiB / 2 vCPU recipe** (`.env`):
+
+```dotenv
+# Memory-safe small-box defaults
+CODE_SPIDER_MAX_FILE_BYTES=524288        # 512 KiB — extra safety margin
+CODE_SPIDER_EMBED_WORKERS=2              # one per vCPU
+CODE_SPIDER_EMBED_BATCH_SIZE=16          # smaller request bodies
+CODE_SPIDER_EMBED_MAX_INPUT_CHARS=8000   # tune to your model's context window
+```
+
+The walker chunks files **inline** during the parse pass and drops the
+source bytes immediately, so the resident set is bounded by **one file at
+a time** rather than the full workspace. The embedding stage processes
+**one repo at a time** with `WORKERS` threads in flight; if any sub-batch
+fails (provider outage, transient 5xx, persistent payload cap), the
+remaining sub-batches finish and the failure is isolated to that slice.
+Progress is rendered live via `rich.progress` when stderr is a TTY,
+otherwise as structured log lines every 5 % so you always see motion.
+
 ### 7. Recommended security model for developers
 
 Create a read-only Neo4j user for developers so a leaked password can't
@@ -221,6 +252,7 @@ Hand `codespider_ro` (not the admin user) to developers running
 code_spider/
 ├── config.py             # env + manifest loading (CWD .env + ~/.config/code-spider/config.env)
 ├── onboarding.py         # `configure` wizard, `mcp-config`, `doctor`
+├── progress.py           # rich.progress (TTY) / structured-log (CI) reporters
 ├── workspace/manifest.py # YAML schema + diff
 ├── checkout/git.py       # GitPython wrapper
 ├── parser/               # tree-sitter language adapters

@@ -69,6 +69,7 @@ def test_registry_lazy_loads_litellm_with_settings(monkeypatch: pytest.MonkeyPat
         timeout_s=30.0,
         max_retries=3,
         max_input_chars=120_000,
+        workers=1,
     )
     provider = get_embedding_provider("litellm", settings=settings)
     assert provider.name == "litellm"

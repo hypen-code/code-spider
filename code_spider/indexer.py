@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import Iterable
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -39,6 +40,8 @@ from code_spider.logging_setup import get_logger
 from code_spider.messaging.kafka_matcher import match_kafka_flows
 from code_spider.observability import METRICS, stage_timer
 from code_spider.parser import get_adapter
+from code_spider.progress import _ProgressReporter
+from code_spider.progress import embed_progress as _embed_progress
 from code_spider.resolver import resolve_workspace
 from code_spider.routes.matcher import match_http_flows
 from code_spider.symbols.model import (
@@ -102,7 +105,6 @@ def index_workspace(
     """
     workspace = manifest.workspace(workspace_id)
     m_sha = manifest_sha(manifest)
-    _SOURCE_CACHE.clear()
 
     # 1-3. Checkout + parse each selected repo.
     bundle = WorkspaceParseBundle(
@@ -169,9 +171,14 @@ def index_workspace(
         bundle.kafka_flows.extend(match_kafka_flows(bundle))
     METRICS.indexer_kafka_flows.labels(workspace=workspace.id).inc(len(bundle.kafka_flows))
 
-    # 7-8. Chunking + (optional) embeddings.
-    with stage_timer("chunk", workspace.id):
-        chunker_stats = _chunk_workspace(bundle=bundle)
+    # 7-8. Chunking happens inline during parse (see `_walk_repo`); here we
+    # just summarise. Embedding is its own stage, parallelised per-repo.
+    chunker_stats = _summarise_chunks(bundle)
+    _log.info(
+        "workspace chunked",
+        workspace=workspace.id,
+        chunks=chunker_stats["chunks"],
+    )
     if embed_provider not in (None, "none", "off"):
         provider = _resolve_embedding_provider(embed_provider, settings=settings)
         if provider is not None:
@@ -180,6 +187,8 @@ def index_workspace(
                     bundle=bundle,
                     provider=provider,
                     expected_dim=settings.embedding.dim,
+                    workers=settings.embedding.workers,
+                    batch_size=settings.embedding.batch_size,
                 )
 
     # 9. Write.
@@ -196,9 +205,7 @@ def index_workspace(
                 deletions_by_repo=deletions_by_repo,
             )
         else:
-            write_stats = writer.write_workspace_bundle(
-                bundle=bundle, repo_metadata=repo_metadata
-            )
+            write_stats = writer.write_workspace_bundle(bundle=bundle, repo_metadata=repo_metadata)
     write_elapsed = time.perf_counter() - write_started
 
     return {
@@ -279,22 +286,30 @@ def _parse_repo(
     )
 
     diff: FileDiff | None = None
+    walk_kwargs: dict[str, Any] = {
+        "workspace_id": workspace.id,
+        "checkout": checkout,
+        "repo": repo,
+        "max_file_bytes": settings.max_file_bytes,
+    }
     if existing_hashes is not None:
-        on_disk = list(_iter_repo_source_pairs(checkout=checkout, repo=repo))
+        on_disk = list(
+            _iter_repo_source_pairs(
+                checkout=checkout,
+                repo=repo,
+                max_file_bytes=settings.max_file_bytes,
+            )
+        )
         diff = compute_diff(
             workspace_id=workspace.id,
             repo_name=repo.name,
             existing_hashes=existing_hashes,
             on_disk_files=on_disk,
         )
-        changed_set = diff.changed_paths
-        file_records = list(
-            _walk_repo(
-                checkout=checkout, repo=repo, only_paths=changed_set
-            )
-        )
+        walk_kwargs["only_paths"] = diff.changed_paths
+        file_records = list(_walk_repo(**walk_kwargs))
     else:
-        file_records = list(_walk_repo(checkout=checkout, repo=repo))
+        file_records = list(_walk_repo(**walk_kwargs))
 
     pr = ParseResult(
         workspace_id=workspace.id,
@@ -316,18 +331,34 @@ def _parse_repo(
 
 def _walk_repo(
     *,
+    workspace_id: str,
     checkout: CheckoutResult,
     repo: RepoConfig,
+    max_file_bytes: int,
     only_paths: frozenset[str] | None = None,
 ) -> Iterable[FileRecord]:
-    """Walk a checkout, parse each source file, populate the source cache.
+    """Walk a checkout, parse + chunk each source file, drop the bytes.
 
-    If ``only_paths`` is provided, only files whose repo-relative path is in
-    the set are parsed; everything else is skipped. The cache lets
-    :func:`_chunk_workspace` re-read bytes without a second disk hit.
+    This used to populate a workspace-wide source cache and let a later
+    ``_chunk_workspace`` stage re-read every file. That design held every
+    repo's raw bytes in RAM through the resolver + flow-matcher stages —
+    catastrophic on a 4 GiB box with even one 10 MiB minified bundle in the
+    workspace. We now:
+
+    * **Skip files larger than ``max_file_bytes``** before reading them.
+      Any source over the cap is logged + counted but never opened.
+    * **Chunk inline** right after parsing each file and attach the chunks
+      to the returned :class:`FileRecord`.
+    * **Drop the source bytes** as soon as parsing + chunking is done so
+      memory pressure stays bounded to one file at a time.
+
+    If ``only_paths`` is provided (incremental mode), only files whose
+    repo-relative path is in the set are parsed; everything else is skipped.
     """
     enabled = set(repo.languages)
     adapters = {lang: get_adapter(lang) for lang in enabled}
+    skipped_oversize = 0
+    biggest_skipped = 0
 
     for source_path in _iter_source_files(checkout.root):
         rel = source_path.relative_to(checkout.root).as_posix()
@@ -336,6 +367,26 @@ def _walk_repo(
         lang = _detect_language(source_path, adapters)
         if lang is None:
             continue
+
+        # Cheap stat() *before* reading the bytes — keeps oversize files
+        # from ever entering the process address space.
+        try:
+            size = source_path.stat().st_size
+        except OSError as exc:
+            _log.warning("cannot stat file", path=rel, error=str(exc))
+            continue
+        if max_file_bytes > 0 and size > max_file_bytes:
+            skipped_oversize += 1
+            biggest_skipped = max(biggest_skipped, size)
+            _log.warning(
+                "skipping oversize file (above CODE_SPIDER_MAX_FILE_BYTES)",
+                repo=repo.name,
+                path=rel,
+                size_bytes=size,
+                cap_bytes=max_file_bytes,
+            )
+            continue
+
         adapter = adapters[lang]
         try:
             source = source_path.read_bytes()
@@ -351,19 +402,62 @@ def _walk_repo(
             continue
 
         hash_hex = blake3.blake3(source).hexdigest()
-        _SOURCE_CACHE[(checkout.repo_name, rel)] = source
-        yield replace(record, hash_blake3=hash_hex)
+        record = replace(record, hash_blake3=hash_hex)
+
+        # Chunk inline. Doing this here (instead of in a separate workspace
+        # pass) lets us free ``source`` immediately and keeps the resident
+        # set bounded to one file's worth of bytes at any moment.
+        try:
+            chunks = chunk_file(
+                workspace_id=workspace_id,
+                repo_name=repo.name,
+                file_record=record,
+                source=source,
+            )
+            record.chunks.extend(chunks)
+        except Exception as exc:
+            _log.error(
+                "chunker failure (continuing without chunks for this file)",
+                path=rel,
+                error=str(exc),
+            )
+
+        # ``source`` goes out of scope at the next loop iteration; explicit
+        # `del` documents intent and helps when this loop is profiled.
+        del source
+        yield record
+
+    if skipped_oversize:
+        _log.info(
+            "walker skipped oversize files",
+            repo=repo.name,
+            skipped=skipped_oversize,
+            biggest_bytes=biggest_skipped,
+            cap_bytes=max_file_bytes,
+        )
 
 
 def _iter_repo_source_pairs(
-    *, checkout: CheckoutResult, repo: RepoConfig
+    *, checkout: CheckoutResult, repo: RepoConfig, max_file_bytes: int
 ) -> Iterable[tuple[str, bytes]]:
-    """Yield ``(repo_relative_path, source_bytes)`` for every supported file."""
+    """Yield ``(repo_relative_path, source_bytes)`` for every supported file.
+
+    Used by the incremental-diff path. Honors the same size cap as
+    :func:`_walk_repo` so oversize files never participate in BLAKE3
+    hashing.
+    """
     enabled = set(repo.languages)
     adapters = {lang: get_adapter(lang) for lang in enabled}
     for source_path in _iter_source_files(checkout.root):
         rel = source_path.relative_to(checkout.root).as_posix()
         if _detect_language(source_path, adapters) is None:
+            continue
+        try:
+            size = source_path.stat().st_size
+        except OSError as exc:
+            _log.warning("cannot stat file (diff)", path=rel, error=str(exc))
+            continue
+        if max_file_bytes > 0 and size > max_file_bytes:
             continue
         try:
             yield rel, source_path.read_bytes()
@@ -401,32 +495,17 @@ def _detect_language(path: Path, adapters: dict[str, object]) -> str | None:
 # --------------------------------------------------------------- chunk/embed
 
 
-def _chunk_workspace(*, bundle: WorkspaceParseBundle) -> dict[str, int]:
-    """Populate ``FileRecord.chunks`` for every file in the bundle."""
+def _summarise_chunks(bundle: WorkspaceParseBundle) -> dict[str, int]:
+    """Sum chunk counts across every repo for the stats payload.
+
+    Chunks are produced inline by :func:`_walk_repo` to keep source bytes
+    out of memory; this helper just rolls up the totals.
+    """
     total = 0
     for pr in bundle.repos:
         for f in pr.files:
-            chunks = chunk_file(
-                workspace_id=bundle.workspace_id,
-                repo_name=pr.repo_name,
-                file_record=f,
-                source=_read_source_for(pr, f),
-            )
-            f.chunks.extend(chunks)
-            total += len(chunks)
-    _log.info("workspace chunked", chunks=total)
+            total += len(f.chunks)
     return {"chunks": total}
-
-
-def _read_source_for(pr: ParseResult, f: FileRecord) -> bytes:
-    """Return the raw bytes for a parsed file (chunker-side accessor)."""
-    return _SOURCE_CACHE[(pr.repo_name, f.repo_relative_path)]
-
-
-# Single-process bytes cache keyed by ``(repo_name, repo_relative_path)``.
-# Populated during the parse walk so the chunker doesn't re-read from disk.
-# Cleared at the start of every :func:`index_workspace` run.
-_SOURCE_CACHE: dict[tuple[str, str], bytes] = {}
 
 
 def _resolve_embedding_provider(
@@ -471,18 +550,26 @@ def _embed_workspace(
     bundle: WorkspaceParseBundle,
     provider: EmbeddingProvider,
     expected_dim: int | None = None,
+    workers: int = 1,
+    batch_size: int = 64,
 ) -> None:
-    """Compute embeddings for every chunk in the bundle, one repo at a time.
+    """Compute embeddings for every chunk in the bundle.
 
-    Each repo is treated as an independent batch:
+    Strategy:
 
-    * its chunk texts are collected,
-    * sent to the provider as a single ``embed_batch`` call (which itself
-      sub-batches by ``CODE_SPIDER_EMBED_BATCH_SIZE`` and pre-truncates
-      oversize inputs),
-    * embeddings are filled back into the in-memory bundle,
-    * if anything raises, the failure is **logged and isolated** so the next
-      repo still gets processed and its chunks still reach Neo4j.
+    * **Per-repo isolation** — each repo is processed independently. If a
+      repo's embed raises (provider outage, persistent oversize chunk), the
+      failure is logged and the loop continues with the next repo so the
+      workspace still gets written.
+    * **Parallel sub-batches per repo** — within a repo, chunk texts are
+      split into ``batch_size`` slices and submitted to a
+      :class:`ThreadPoolExecutor` with ``workers`` threads. Embedding work
+      is I/O-bound (network calls to the provider) so threading — not
+      multiprocessing — is the right fit and avoids GIL contention.
+    * **Live progress** — when stderr is a TTY, a :mod:`rich.progress` bar
+      tracks chunks completed / total / rate / ETA per workspace. When not
+      a TTY (CI, ``code-spider serve`` under an agent), the same data is
+      logged structurally every ~5 % so users still see the work breathing.
 
     The full bundle (including any repos whose embeddings failed and were
     written without vectors) is persisted in a single workspace-level write
@@ -504,60 +591,43 @@ def _embed_workspace(
             "first)."
         )
 
+    total_chunks = sum(len(f.chunks) for pr in bundle.repos for f in pr.files)
+    if total_chunks == 0:
+        return
+
+    workers = max(1, workers)
+    batch_size = max(1, batch_size)
+    _log.info(
+        "embedding workspace",
+        workspace=bundle.workspace_id,
+        chunks=total_chunks,
+        repos=len(bundle.repos),
+        workers=workers,
+        batch_size=batch_size,
+        provider=provider.name,
+        dim=provider.dim,
+    )
+
     total_embedded = 0
     total_failed_repos = 0
-    for r_idx, pr in enumerate(bundle.repos):
-        repo_pairs: list[tuple[int, int]] = []  # (file_idx, chunk_idx) within this repo
-        repo_texts: list[str] = []
-        for f_idx, f in enumerate(pr.files):
-            for c_idx, c in enumerate(f.chunks):
-                repo_pairs.append((f_idx, c_idx))
-                repo_texts.append(c.text)
-        if not repo_texts:
-            continue
-
-        try:
-            vectors = provider.embed_batch(repo_texts)
-        except Exception as exc:
-            # Isolate per-repo failures: log the offending repo and move on
-            # so the rest of the workspace still gets embedded + written.
-            total_failed_repos += 1
-            _log.error(
-                "repo embed failed; continuing with remaining repos",
-                workspace=bundle.workspace_id,
-                repo=pr.repo_name,
-                chunks=len(repo_texts),
-                provider=provider.name,
-                error=str(exc),
+    with _embed_progress(total_chunks=total_chunks, workspace_id=bundle.workspace_id) as progress:
+        for r_idx in range(len(bundle.repos)):
+            ok = _embed_one_repo(
+                bundle=bundle,
+                r_idx=r_idx,
+                provider=provider,
+                workers=workers,
+                batch_size=batch_size,
+                progress=progress,
             )
-            continue
-
-        if len(vectors) != len(repo_pairs):
-            total_failed_repos += 1
-            _log.error(
-                "embedding provider returned wrong shape for repo",
-                workspace=bundle.workspace_id,
-                repo=pr.repo_name,
-                expected=len(repo_pairs),
-                got=len(vectors),
-            )
-            continue
-
-        for (f_idx, c_idx), vec in zip(repo_pairs, vectors, strict=True):
-            chunks = bundle.repos[r_idx].files[f_idx].chunks
-            chunks[c_idx] = replace(chunks[c_idx], embedding=tuple(vec))
-        total_embedded += len(repo_pairs)
-        _log.info(
-            "repo embedded",
-            workspace=bundle.workspace_id,
-            repo=pr.repo_name,
-            chunks=len(repo_pairs),
-            provider=provider.name,
-            dim=provider.dim,
-        )
+            if ok is None:
+                total_failed_repos += 1
+            else:
+                total_embedded += ok
 
     _log.info(
         "workspace embedded",
+        workspace=bundle.workspace_id,
         chunks=total_embedded,
         failed_repos=total_failed_repos,
         provider=provider.name,
@@ -565,3 +635,145 @@ def _embed_workspace(
     )
 
 
+def _embed_one_repo(
+    *,
+    bundle: WorkspaceParseBundle,
+    r_idx: int,
+    provider: EmbeddingProvider,
+    workers: int,
+    batch_size: int,
+    progress: _ProgressReporter,
+) -> int | None:
+    """Embed every chunk of one repo in parallel sub-batches.
+
+    Returns the number of chunks successfully embedded, or ``None`` if the
+    repo failed entirely (caller bumps a per-workspace failure counter).
+    """
+    pr = bundle.repos[r_idx]
+    pairs: list[tuple[int, int]] = []  # (file_idx, chunk_idx)
+    texts: list[str] = []
+    for f_idx, f in enumerate(pr.files):
+        for c_idx, c in enumerate(f.chunks):
+            pairs.append((f_idx, c_idx))
+            texts.append(c.text)
+    if not texts:
+        return 0
+
+    progress.start_repo(pr.repo_name, total=len(texts))
+    started = time.perf_counter()
+
+    # Split into batch-sized sub-batches; submit to a thread pool. We track
+    # original (start, end) so results land in the correct slots even when
+    # futures complete out-of-order.
+    slices: list[tuple[int, int]] = []
+    for start in range(0, len(texts), batch_size):
+        slices.append((start, min(start + batch_size, len(texts))))
+
+    vectors, n_failures = _dispatch_slices(
+        provider=provider,
+        texts=texts,
+        slices=slices,
+        workers=workers,
+        on_advance=progress.advance_repo,
+        log_ctx={"workspace": bundle.workspace_id, "repo": pr.repo_name},
+    )
+
+    elapsed = time.perf_counter() - started
+    progress.finish_repo()
+
+    if n_failures == len(slices):
+        _log.error(
+            "every sub-batch failed for repo; embeddings unavailable",
+            workspace=bundle.workspace_id,
+            repo=pr.repo_name,
+            sub_batches=len(slices),
+        )
+        return None
+
+    # Apply the successful vectors. Slots that stayed ``None`` (failed
+    # sub-batches) keep their existing empty embedding tuple — those chunks
+    # are still indexed structurally; only vector search loses them.
+    applied = 0
+    for (f_idx, c_idx), vec in zip(pairs, vectors, strict=True):
+        if vec is None:
+            continue
+        chunks = bundle.repos[r_idx].files[f_idx].chunks
+        chunks[c_idx] = replace(chunks[c_idx], embedding=tuple(vec))
+        applied += 1
+
+    rate = applied / elapsed if elapsed > 0 else 0.0
+    _log.info(
+        "repo embedded",
+        workspace=bundle.workspace_id,
+        repo=pr.repo_name,
+        chunks=applied,
+        failed_sub_batches=n_failures,
+        elapsed_s=round(elapsed, 2),
+        rate_per_s=round(rate, 1),
+        provider=provider.name,
+    )
+    return applied
+
+
+def _dispatch_slices(
+    *,
+    provider: EmbeddingProvider,
+    texts: list[str],
+    slices: list[tuple[int, int]],
+    workers: int,
+    on_advance: Any,
+    log_ctx: dict[str, Any],
+) -> tuple[list[list[float] | None], int]:
+    """Embed each slice (single-thread fast path or thread-pool) and
+    aggregate results into one ``vectors`` array.
+
+    Pulled out of :func:`_embed_one_repo` so the branch-count of the main
+    function stays under ruff's threshold; also lets us unit-test the
+    dispatcher in isolation if we ever need to.
+    """
+    vectors: list[list[float] | None] = [None] * len(texts)
+    failures = 0
+
+    def _land(
+        start: int,
+        end: int,
+        vecs: list[list[float]] | None,
+        exc: Exception | None,
+    ) -> None:
+        nonlocal failures
+        ok = exc is None and vecs is not None and len(vecs) == end - start
+        if ok:
+            assert vecs is not None
+            for i, vec in enumerate(vecs):
+                vectors[start + i] = vec
+        else:
+            failures += 1
+            _log.error(
+                "sub-batch embed failed",
+                **log_ctx,
+                range=f"{start}..{end}",
+                expected=end - start,
+                got=0 if vecs is None else len(vecs),
+                error=str(exc) if exc is not None else "wrong-shape response",
+            )
+        on_advance(end - start)
+
+    # Single-thread fast path: keep tests deterministic, skip executor cost.
+    if workers == 1 or len(slices) == 1:
+        for start, end in slices:
+            try:
+                _land(start, end, provider.embed_batch(texts[start:end]), None)
+            except Exception as exc:
+                _land(start, end, None, exc)
+        return vectors, failures
+
+    # Parallel path: threaded I/O. Bounded by `workers`.
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="embed") as pool:
+        future_to_slice = {pool.submit(provider.embed_batch, texts[s:e]): (s, e) for s, e in slices}
+        for future in as_completed(future_to_slice):
+            start, end = future_to_slice[future]
+            try:
+                _land(start, end, future.result(), None)
+            except Exception as exc:
+                _land(start, end, None, exc)
+    return vectors, failures

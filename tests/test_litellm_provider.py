@@ -30,6 +30,7 @@ def _settings(
     timeout_s: float = 30.0,
     max_retries: int = 3,
     max_input_chars: int = 120_000,
+    workers: int = 1,
 ) -> EmbeddingSettings:
     return EmbeddingSettings(
         provider="litellm",
@@ -41,6 +42,7 @@ def _settings(
         timeout_s=timeout_s,
         max_retries=max_retries,
         max_input_chars=max_input_chars,
+        workers=workers,
     )
 
 
