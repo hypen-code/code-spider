@@ -472,15 +472,24 @@ def _embed_workspace(
     provider: EmbeddingProvider,
     expected_dim: int | None = None,
 ) -> None:
-    """Compute embeddings for every chunk in the bundle."""
-    pairs: list[tuple[int, int, int]] = []  # (repo_idx, file_idx, chunk_idx)
-    texts: list[str] = []
-    for r_idx, pr in enumerate(bundle.repos):
-        for f_idx, f in enumerate(pr.files):
-            for c_idx, c in enumerate(f.chunks):
-                pairs.append((r_idx, f_idx, c_idx))
-                texts.append(c.text)
-    if not texts:
+    """Compute embeddings for every chunk in the bundle, one repo at a time.
+
+    Each repo is treated as an independent batch:
+
+    * its chunk texts are collected,
+    * sent to the provider as a single ``embed_batch`` call (which itself
+      sub-batches by ``CODE_SPIDER_EMBED_BATCH_SIZE`` and pre-truncates
+      oversize inputs),
+    * embeddings are filled back into the in-memory bundle,
+    * if anything raises, the failure is **logged and isolated** so the next
+      repo still gets processed and its chunks still reach Neo4j.
+
+    The full bundle (including any repos whose embeddings failed and were
+    written without vectors) is persisted in a single workspace-level write
+    at the end of :func:`index_workspace`. Chunks that failed to embed are
+    still indexed structurally; only vector search loses coverage for them.
+    """
+    if not bundle.repos:
         return
 
     # Fail fast on dim mismatch so an operator who flipped CODE_SPIDER_EMBED_*
@@ -495,21 +504,62 @@ def _embed_workspace(
             "first)."
         )
 
-    vectors = provider.embed_batch(texts)
-    if len(vectors) != len(pairs):
-        _log.error(
-            "embedding provider returned wrong shape",
-            expected=len(pairs),
-            got=len(vectors),
-        )
-        return
+    total_embedded = 0
+    total_failed_repos = 0
+    for r_idx, pr in enumerate(bundle.repos):
+        repo_pairs: list[tuple[int, int]] = []  # (file_idx, chunk_idx) within this repo
+        repo_texts: list[str] = []
+        for f_idx, f in enumerate(pr.files):
+            for c_idx, c in enumerate(f.chunks):
+                repo_pairs.append((f_idx, c_idx))
+                repo_texts.append(c.text)
+        if not repo_texts:
+            continue
 
-    for (r_idx, f_idx, c_idx), vec in zip(pairs, vectors, strict=True):
-        chunks = bundle.repos[r_idx].files[f_idx].chunks
-        chunks[c_idx] = replace(chunks[c_idx], embedding=tuple(vec))
+        try:
+            vectors = provider.embed_batch(repo_texts)
+        except Exception as exc:
+            # Isolate per-repo failures: log the offending repo and move on
+            # so the rest of the workspace still gets embedded + written.
+            total_failed_repos += 1
+            _log.error(
+                "repo embed failed; continuing with remaining repos",
+                workspace=bundle.workspace_id,
+                repo=pr.repo_name,
+                chunks=len(repo_texts),
+                provider=provider.name,
+                error=str(exc),
+            )
+            continue
+
+        if len(vectors) != len(repo_pairs):
+            total_failed_repos += 1
+            _log.error(
+                "embedding provider returned wrong shape for repo",
+                workspace=bundle.workspace_id,
+                repo=pr.repo_name,
+                expected=len(repo_pairs),
+                got=len(vectors),
+            )
+            continue
+
+        for (f_idx, c_idx), vec in zip(repo_pairs, vectors, strict=True):
+            chunks = bundle.repos[r_idx].files[f_idx].chunks
+            chunks[c_idx] = replace(chunks[c_idx], embedding=tuple(vec))
+        total_embedded += len(repo_pairs)
+        _log.info(
+            "repo embedded",
+            workspace=bundle.workspace_id,
+            repo=pr.repo_name,
+            chunks=len(repo_pairs),
+            provider=provider.name,
+            dim=provider.dim,
+        )
+
     _log.info(
         "workspace embedded",
-        chunks=len(pairs),
+        chunks=total_embedded,
+        failed_repos=total_failed_repos,
         provider=provider.name,
         dim=provider.dim,
     )

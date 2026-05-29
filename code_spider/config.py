@@ -92,6 +92,13 @@ class EmbeddingSettings:
     api_key: str | None
     timeout_s: float
     max_retries: int
+    # Per-input character cap. Most hosted embedding models reject any single
+    # input longer than ~131_072 characters (Qwen-3, Voyage, OpenAI's larger
+    # context models all sit in that range). We default to 120_000 to leave
+    # headroom and pre-truncate anything longer at the provider boundary so a
+    # single huge auto-generated or minified file can't crash the whole
+    # workspace embed. Override with ``CODE_SPIDER_EMBED_MAX_INPUT_CHARS``.
+    max_input_chars: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -117,9 +124,7 @@ def _env_int(name: str, default: int) -> int:
     try:
         return int(raw)
     except ValueError as exc:
-        raise RuntimeError(
-            f"CODE_SPIDER_{name} must be an integer, got {raw!r}"
-        ) from exc
+        raise RuntimeError(f"CODE_SPIDER_{name} must be an integer, got {raw!r}") from exc
 
 
 def _env_float(name: str, default: float) -> float:
@@ -129,9 +134,7 @@ def _env_float(name: str, default: float) -> float:
     try:
         return float(raw)
     except ValueError as exc:
-        raise RuntimeError(
-            f"CODE_SPIDER_{name} must be a float, got {raw!r}"
-        ) from exc
+        raise RuntimeError(f"CODE_SPIDER_{name} must be a float, got {raw!r}") from exc
 
 
 def _load_embedding_settings() -> EmbeddingSettings:
@@ -149,6 +152,9 @@ def _load_embedding_settings() -> EmbeddingSettings:
         api_key=_env("EMBED_API_KEY"),
         timeout_s=_env_float("EMBED_TIMEOUT_S", 30.0),
         max_retries=_env_int("EMBED_MAX_RETRIES", 3),
+        # 120_000 < the 131_072 cap shared by Voyage / Qwen-3 / most modern
+        # embedding endpoints; leaves ~10k headroom for safety overhead.
+        max_input_chars=_env_int("EMBED_MAX_INPUT_CHARS", 120_000),
     )
 
 

@@ -67,6 +67,16 @@ _PAYLOAD_TOO_LARGE_MARKERS: tuple[str, ...] = (
     "request too large",
     "max_tokens_per_request",
     "context length",
+    # OpenRouter's gateway-level size cap surfaces as a 400 with this exact
+    # phrasing instead of a 413; treat it as "shrink and retry" too.
+    "input size exceeds",
+    "total text input size",
+    # Per-input character cap (Voyage / Qwen-3 / OpenAI larger context models):
+    #     "Value error, The input sequence should have less than 131072 characters."
+    # When the single offending input is still over the per-request cap after
+    # halving down to size 1, the provider returns a 422 with this wording.
+    "input sequence should have less than",
+    "input length",
 )
 
 
@@ -191,9 +201,7 @@ class LiteLLMEmbeddingProvider:
         response = embed(**kwargs)
         vectors = self._extract_vectors(response)
         if len(vectors) != len(chunk):
-            raise RuntimeError(
-                f"litellm returned {len(vectors)} vectors for {len(chunk)} inputs"
-            )
+            raise RuntimeError(f"litellm returned {len(vectors)} vectors for {len(chunk)} inputs")
         return vectors
 
     def _embed_with_halving(self, embed: Any, chunk: list[str]) -> list[list[float]]:
@@ -201,25 +209,46 @@ class LiteLLMEmbeddingProvider:
 
         Some gateways (notably OpenRouter's nginx layer in front of certain
         backends like Perplexity) impose a per-request body cap well below
-        the provider's documented batch limit. When we see a 413 we split
-        the batch in half and try each half. Bottoming out at a single
-        oversized input re-raises with a clear message — the caller would
-        need to lower ``CODE_SPIDER_EMBED_BATCH_SIZE`` or pre-truncate.
+        the provider's documented batch limit. When we see a 413/422 we split
+        the batch in half and try each half.
+
+        Bottoming out at a *single* still-oversized input is the failure mode
+        a giant auto-generated or minified source file triggers (e.g. a 10 MB
+        bundle that slips past ``max_input_chars`` pre-truncation because the
+        cap was misconfigured). To prevent one such input from killing the
+        whole workspace embed, we log a clear warning and substitute a
+        zero-vector for that one chunk; downstream cosine similarity against
+        a zero vector is always 0 so the chunk is effectively excluded from
+        vector search without poisoning anything else.
         """
         try:
             return self._embed_one_call(embed, chunk)
         except Exception as exc:
-            if len(chunk) > 1 and _is_payload_too_large(exc):
-                mid = len(chunk) // 2
-                _log.warning(
-                    "litellm payload too large; halving batch and retrying",
+            if _is_payload_too_large(exc):
+                if len(chunk) > 1:
+                    mid = len(chunk) // 2
+                    _log.warning(
+                        "litellm payload too large; halving batch and retrying",
+                        model=self._settings.model,
+                        from_size=len(chunk),
+                        to_size=mid,
+                    )
+                    left = self._embed_with_halving(embed, chunk[:mid])
+                    right = self._embed_with_halving(embed, chunk[mid:])
+                    return left + right
+                # Single input still rejected — skip it instead of crashing
+                # the whole run. The zero vector is a sentinel: it is not
+                # L2-normalised (`_normalise` returns zero-vectors unchanged)
+                # so cosine similarity against it is always 0.
+                _log.error(
+                    "litellm rejected single oversized input; emitting zero "
+                    "vector to skip without aborting the workspace embed",
                     model=self._settings.model,
-                    from_size=len(chunk),
-                    to_size=mid,
+                    input_chars=len(chunk[0]) if chunk else 0,
+                    max_input_chars=self._settings.max_input_chars,
+                    error=str(exc),
                 )
-                left = self._embed_with_halving(embed, chunk[:mid])
-                right = self._embed_with_halving(embed, chunk[mid:])
-                return left + right
+                return [[0.0] * self._settings.dim]
             _log.error(
                 "litellm embedding call failed",
                 model=self._settings.model,
@@ -229,18 +258,62 @@ class LiteLLMEmbeddingProvider:
             )
             raise
 
+    def _truncate_oversize(self, texts: list[str]) -> list[str]:
+        """Pre-truncate any single input longer than ``max_input_chars``.
+
+        The hosted embedding endpoints we target all enforce a per-input
+        character (not just per-batch) cap and reject the entire request when
+        any one input exceeds it. Truncating to a safe ceiling at the
+        provider boundary is the cheapest way to keep one rogue file from
+        crashing the workspace run. The truncated chunk still gets *an*
+        embedding — partial vector coverage of a 10 MB blob is rarely useful,
+        but it's better than aborting and losing every other chunk in the
+        same indexing run.
+        """
+        cap = self._settings.max_input_chars
+        if cap <= 0:
+            return texts
+        out: list[str] = []
+        oversize = 0
+        worst = 0
+        for t in texts:
+            if len(t) > cap:
+                oversize += 1
+                worst = max(worst, len(t))
+                out.append(t[:cap])
+            else:
+                out.append(t)
+        if oversize:
+            _log.warning(
+                "pre-truncated oversize inputs before embedding",
+                model=self._settings.model,
+                oversize_count=oversize,
+                worst_chars=worst,
+                cap_chars=cap,
+            )
+        return out
+
     # --- Public API -------------------------------------------------------- #
 
     def embed_batch(self, texts: list[str]) -> list[list[float]]:
-        """Embed ``texts`` in provider-bounded batches; returns L2-normalised vectors."""
+        """Embed ``texts`` in provider-bounded batches; returns L2-normalised vectors.
+
+        Inputs longer than ``max_input_chars`` are pre-truncated at the
+        provider boundary so a single rogue file cannot crash the run. If
+        the upstream still rejects a single oversized chunk (misconfigured
+        cap, unusual model limit), that chunk gets a zero-vector and a loud
+        warning instead of aborting the whole call.
+        """
         if not texts:
             return []
         embed = self._resolve_sdk()
         out: list[list[float]] = []
         expected_dim = self._settings.dim
 
-        for start in range(0, len(texts), self._batch_size):
-            chunk = texts[start : start + self._batch_size]
+        safe_texts = self._truncate_oversize(texts)
+
+        for start in range(0, len(safe_texts), self._batch_size):
+            chunk = safe_texts[start : start + self._batch_size]
             vectors = self._embed_with_halving(embed, chunk)
             for v in vectors:
                 if len(v) != expected_dim:
