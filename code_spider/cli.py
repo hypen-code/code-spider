@@ -77,8 +77,7 @@ def migrate() -> None:
         client.verify()
         apply_schema(client, embedding_dim=settings.embedding.dim)
     console.print(
-        f"[green]Schema applied.[/green] "
-        f"[dim](vector dim={settings.embedding.dim})[/dim]"
+        f"[green]Schema applied.[/green] [dim](vector dim={settings.embedding.dim})[/dim]"
     )
 
 
@@ -152,17 +151,23 @@ def index(
     table.add_column("files", justify="right")
     table.add_column("symbols", justify="right")
     table.add_column("routes", justify="right")
+    # The ``kafka`` column shows **distinct non-dynamic Kafka topics this
+    # repo touches** — not the raw ``kafka_producers + kafka_consumers``
+    # call-site count, which over-reports on common Python idioms like
+    # ``requests.Session().send(req)`` or ``observable.subscribe(handler)``
+    # that share method names with kafka-python / aiokafka. A repo with
+    # ``kafka == 0`` truly does not use Kafka; anything > 0 has at least
+    # one string-literal topic that could form a flow edge.
     table.add_column("kafka", justify="right")
     table.add_column("chunks", justify="right")
     for r in result["repos"]:
-        kafka_total = r.get("kafka_producers", 0) + r.get("kafka_consumers", 0)
         table.add_row(
             str(r["repo"]),
             str(r["commit"])[:12],
             str(r.get("files", 0)),
             str(r.get("symbols", 0)),
             str(r.get("routes", 0)),
-            str(kafka_total),
+            str(r.get("kafka_topics", 0)),
             str(r.get("chunks", 0)),
         )
     console.print(table)

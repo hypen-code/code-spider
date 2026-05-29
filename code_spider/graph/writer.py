@@ -30,6 +30,7 @@ from neo4j import ManagedTransaction
 from code_spider.graph.client import Neo4jClient, retry_on_transient
 from code_spider.graph.count_cache import invalidate_workspace
 from code_spider.logging_setup import get_logger
+from code_spider.messaging.kafka_matcher import count_repo_topics
 from code_spider.symbols.model import (
     Chunk,
     FileRecord,
@@ -339,9 +340,7 @@ class GraphWriter:
     # ----------------------------------------------------------- public API
 
     @retry_on_transient
-    def delete_files(
-        self, *, workspace_id: str, repo_name: str, paths: list[str]
-    ) -> None:
+    def delete_files(self, *, workspace_id: str, repo_name: str, paths: list[str]) -> None:
         """Surgically drop every node sourced from ``paths``. Idempotent."""
         if not paths:
             return
@@ -579,9 +578,7 @@ class GraphWriter:
         common = _repo_common(bundle, pr, repo_meta)
         session.execute_write(_run_unit, query=_CLEAR_REPO, params=common)
         session.execute_write(_run_unit, query=_CLEAR_REPO_MODULES, params=common)
-        session.execute_write(
-            _run_unit, query=_CLEAR_REPO_ROUTES_AND_CLIENTS, params=common
-        )
+        session.execute_write(_run_unit, query=_CLEAR_REPO_ROUTES_AND_CLIENTS, params=common)
         self._write_repo_content(
             session=session, bundle=bundle, pr=pr, common=common, out_stats=out_stats
         )
@@ -617,8 +614,18 @@ class GraphWriter:
             "symbols": 0,
             "routes": 0,
             "http_clients": 0,
+            # Raw heuristic call-site counts. These are kept for internal
+            # diagnostics (and for the existing Prometheus counters) but
+            # **must not** be used as the developer-facing "uses Kafka?"
+            # signal — the method-name heuristic over-counts on common
+            # idioms like ``requests.Session().send`` and observer-pattern
+            # ``.subscribe``. Use ``kafka_topics`` for that.
             "kafka_producers": 0,
             "kafka_consumers": 0,
+            # Distinct non-dynamic Kafka topics this repo touches. This is
+            # the count the CLI surfaces because it strips false positives
+            # using the same gate the flow matcher applies.
+            "kafka_topics": 0,
             "chunks": 0,
         }
 
@@ -630,9 +637,7 @@ class GraphWriter:
         modules_payload = [_module_payload(f) for f in pr.files if f.module]
         symbols_payload = [_symbol_payload(s) for f in pr.files for s in f.symbols]
         routes_payload = [
-            _route_payload(bundle.workspace_id, pr.repo_name, r)
-            for f in pr.files
-            for r in f.routes
+            _route_payload(bundle.workspace_id, pr.repo_name, r) for f in pr.files for r in f.routes
         ]
         clients_payload = [
             _http_client_payload(bundle.workspace_id, pr.repo_name, h)
@@ -713,6 +718,11 @@ class GraphWriter:
             )
             repo_stats["chunks"] = len(chunks_payload)
 
+        # Compute the developer-facing Kafka usage signal *after* the raw
+        # call-site counts are populated, so the dict is self-consistent
+        # whether or not the heuristic fired on noisy method names.
+        repo_stats["kafka_topics"] = count_repo_topics(pr)
+
         out_stats["repos"][pr.repo_name] = repo_stats
 
     # --------------------------------------------------------- batching
@@ -734,9 +744,7 @@ class GraphWriter:
                 )
                 batch = []
         if batch:
-            session.execute_write(
-                _run_unit, query=query, params={**base_params, "batch": batch}
-            )
+            session.execute_write(_run_unit, query=query, params={**base_params, "batch": batch})
 
 
 # --------------------------------------------------------- payload mappers
@@ -805,9 +813,7 @@ def _route_payload(workspace_id: str, repo: str, r: Route) -> dict[str, Any]:
     }
 
 
-def _http_client_payload(
-    workspace_id: str, repo: str, h: HttpClientCall
-) -> dict[str, Any]:
+def _http_client_payload(workspace_id: str, repo: str, h: HttpClientCall) -> dict[str, Any]:
     return {
         "call_id": _stable_id(
             "httpc",
@@ -829,9 +835,7 @@ def _http_client_payload(
     }
 
 
-def _kafka_producer_payload(
-    workspace_id: str, repo: str, p: KafkaProducer
-) -> dict[str, Any]:
+def _kafka_producer_payload(workspace_id: str, repo: str, p: KafkaProducer) -> dict[str, Any]:
     return {
         "producer_id": _stable_id(
             "kp",
@@ -851,9 +855,7 @@ def _kafka_producer_payload(
     }
 
 
-def _kafka_consumer_payload(
-    workspace_id: str, repo: str, c: KafkaConsumer
-) -> dict[str, Any]:
+def _kafka_consumer_payload(workspace_id: str, repo: str, c: KafkaConsumer) -> dict[str, Any]:
     return {
         "consumer_id": _stable_id(
             "kc",
