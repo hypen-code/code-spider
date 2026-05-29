@@ -58,6 +58,7 @@ you need. No Docker, no local Neo4j, no indexing.
 ```bash
 # 1. Install (requires Python 3.12+)
 pip install code-spider              # or: pipx install code-spider
+pip install 'code-spider[embedding]' # for external embedding models
 # or zero-install with uv:           uvx code-spider serve
 
 # 2. Point it at the central Neo4j
