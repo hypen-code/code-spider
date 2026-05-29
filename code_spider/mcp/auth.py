@@ -18,16 +18,44 @@ from __future__ import annotations
 import re
 import time
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from functools import wraps
 from typing import Any, TypeVar
 
 from neo4j import READ_ACCESS, Session
 
+from code_spider.config import _DEFAULT_TOOL_TIMEOUT_S
 from code_spider.graph.client import Neo4jClient
 from code_spider.logging_setup import get_logger
 from code_spider.observability import METRICS
 
 _log = get_logger("code_spider.mcp.audit")
+
+#: Shared executor used to enforce a per-call wall-clock timeout on tools.
+#: FastMCP already dispatches sync tools on a worker thread; running the tool
+#: body on a second daemon thread lets us return a ``TimeoutError`` to the
+#: agent promptly even when the underlying query is still blocked. The
+#: orphaned worker drains in the background (the Neo4j session it owns is
+#: closed when its ``with`` block unwinds), so we never wait on it.
+_TOOL_EXECUTOR = ThreadPoolExecutor(
+    max_workers=8, thread_name_prefix="codespider-tool"
+)
+
+
+def _resolve_tool_timeout_s() -> float:
+    """Return the configured per-tool timeout in seconds.
+
+    Reads ``settings.tool_timeout_s`` from the live :class:`ServerContext`
+    when one exists (the normal server path). Falls back to the static
+    default when the context is not initialised — e.g. tools invoked
+    directly from unit tests — so the decorator never hard-fails.
+    """
+    try:
+        from code_spider.mcp.context import get_context
+
+        return get_context().settings.tool_timeout_s
+    except Exception:  # noqa: BLE001 — context optional outside the server
+        return _DEFAULT_TOOL_TIMEOUT_S
 
 
 # Identifiers we are willing to interpolate into MERGE/MATCH parameters.
@@ -87,8 +115,21 @@ def audited(tool_name: str) -> Callable[[Callable[..., T]], Callable[..., T]]:
         def wrapper(*args: Any, **kwargs: Any) -> T:
             started = time.perf_counter()
             audit_kwargs = {k: v for k, v in kwargs.items() if k != "query_text"}
+            timeout_s = _resolve_tool_timeout_s()
             try:
-                result = fn(*args, **kwargs)
+                if timeout_s and timeout_s > 0:
+                    future = _TOOL_EXECUTOR.submit(fn, *args, **kwargs)
+                    try:
+                        result = future.result(timeout=timeout_s)
+                    except FuturesTimeoutError as exc:
+                        # Don't block on the orphaned worker; it drains on its own.
+                        future.cancel()
+                        raise TimeoutError(
+                            f"{tool_name} timed out after {timeout_s:g}s "
+                            "(configure via CODE_SPIDER_TOOL_TIMEOUT_S)"
+                        ) from exc
+                else:
+                    result = fn(*args, **kwargs)
             except Exception as exc:
                 duration = time.perf_counter() - started
                 METRICS.mcp_tool_duration.labels(tool=tool_name).observe(duration)

@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import time
+
 import pytest
 
+from code_spider.mcp import auth
 from code_spider.mcp.auth import (
     assert_safe_identifier,
     assert_safe_workspace_id,
@@ -73,3 +76,29 @@ def test_audited_decorator_re_raises_errors() -> None:
 
     with pytest.raises(RuntimeError, match="nope"):
         boom()
+
+
+def test_audited_decorator_times_out_slow_tool(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(auth, "_resolve_tool_timeout_s", lambda: 0.05)
+
+    @audited("slow")
+    def slow_tool() -> int:
+        time.sleep(5)
+        return 1
+
+    with pytest.raises(TimeoutError, match="slow timed out after 0.05s"):
+        slow_tool()
+
+
+def test_audited_decorator_disables_timeout_when_non_positive(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(auth, "_resolve_tool_timeout_s", lambda: 0.0)
+
+    @audited("unbounded")
+    def quick_tool() -> int:
+        return 42
+
+    assert quick_tool() == 42

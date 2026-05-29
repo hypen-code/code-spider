@@ -91,6 +91,7 @@ def test_phase0_index_writes_expected_graph(
         log_level="WARNING",
         log_json=False,
         max_file_bytes=1_048_576,
+        tool_timeout_s=20.0,
     )
 
     with Neo4jClient(neo4j_settings) as client:

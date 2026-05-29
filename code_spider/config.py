@@ -38,6 +38,12 @@ _DEFAULT_MAX_INPUT_CHARS = 120_000
 #: indexer well under 4 GiB peak resident on a typical small CI runner.
 _DEFAULT_MAX_FILE_BYTES = 1_048_576  # 1 MiB
 
+#: Default wall-clock ceiling (seconds) for a single MCP tool invocation.
+#: A tool that runs longer than this is aborted so an agent never waits
+#: indefinitely on a slow/hung query. Override with
+#: ``CODE_SPIDER_TOOL_TIMEOUT_S``; set ``0`` (or negative) to disable.
+_DEFAULT_TOOL_TIMEOUT_S = 20.0
+
 
 def user_config_path() -> Path:
     """Return the user-global config-env path (does not have to exist)."""
@@ -135,6 +141,11 @@ class Settings:
     # larger than this are skipped at the walker with a counter + warning.
     # See ``_DEFAULT_MAX_FILE_BYTES`` for the rationale.
     max_file_bytes: int
+    # Wall-clock ceiling (seconds) for a single MCP tool invocation. A tool
+    # exceeding this is aborted with a ``TimeoutError`` so agents never wait
+    # indefinitely. ``<= 0`` disables the timeout. See
+    # ``_DEFAULT_TOOL_TIMEOUT_S``.
+    tool_timeout_s: float
 
 
 # ---- Embedding env loader ------------------------------------------------- #
@@ -211,4 +222,5 @@ def load_settings() -> Settings:
         log_level=_env_required("LOG_LEVEL", "INFO").upper(),
         log_json=_env("LOG_JSON", "0") in {"1", "true", "True", "yes"},
         max_file_bytes=_env_int("MAX_FILE_BYTES", _DEFAULT_MAX_FILE_BYTES),
+        tool_timeout_s=_env_float("TOOL_TIMEOUT_S", _DEFAULT_TOOL_TIMEOUT_S),
     )
