@@ -88,6 +88,46 @@ code-spider index --workspace demo
 MATCH (s:Symbol) RETURN s.kind, count(*) AS n ORDER BY n DESC;
 ```
 
+### 6. How to drive it
+```bash
+# Full Phase 1 indexing run with embeddings + metrics
+code-spider migrate
+code-spider index --workspace demo --embed sentence-transformers --metrics-port 9464
+
+# Phase 2 incremental on subsequent runs (skip unchanged files)
+code-spider index --workspace demo --incremental --embed auto
+
+# MCP server (stdio JSON-RPC) for agent consumption
+code-spider serve
+
+# Prometheus metrics (when --metrics-port supplied)
+curl http://localhost:9464/metrics | grep code_spider_
+```
+
+### 7. MCP server
+
+```json
+{
+  "mcpServers": {
+    "code-spider": {
+      "command": "~/code-spider/.venv/bin/code-spider",
+      "args": ["serve", "--embed", "auto"],
+      "cwd": "~/code-spider",
+      "env": {
+        "CODE_SPIDER_NEO4J_URI": "bolt://localhost:7687",
+        "CODE_SPIDER_NEO4J_USER": "neo4j",
+        "CODE_SPIDER_NEO4J_PASSWORD": "password",
+        "CODE_SPIDER_NEO4J_DATABASE": "neo4j",
+        "CODE_SPIDER_MANIFEST_PATH": "~/code-spider/workspaces.yaml",
+        "CODE_SPIDER_CHECKOUT_ROOT": "~/code-spider/checkouts",
+        "CODE_SPIDER_LOG_LEVEL": "INFO",
+        "CODE_SPIDER_LOG_JSON": "1"
+      }
+    }
+  }
+}
+```
+
 ## Layout
 
 ```
