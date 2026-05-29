@@ -44,6 +44,14 @@ _DEFAULT_MAX_FILE_BYTES = 1_048_576  # 1 MiB
 #: ``CODE_SPIDER_TOOL_TIMEOUT_S``; set ``0`` (or negative) to disable.
 _DEFAULT_TOOL_TIMEOUT_S = 20.0
 
+#: Default wall-clock ceiling (seconds) for ``index_repository``. Indexing a
+#: workspace clones repos, parses every file and embeds chunks — it routinely
+#: runs for minutes, far longer than the generic tool timeout. We therefore
+#: give it its own knob (``CODE_SPIDER_INDEX_TIMEOUT_S``) and disable the
+#: timeout by default (``0``) so an interactive reindex is never killed
+#: mid-run. Set a positive value to cap it.
+_DEFAULT_INDEX_TIMEOUT_S = 0.0
+
 
 def user_config_path() -> Path:
     """Return the user-global config-env path (does not have to exist)."""
@@ -146,6 +154,11 @@ class Settings:
     # indefinitely. ``<= 0`` disables the timeout. See
     # ``_DEFAULT_TOOL_TIMEOUT_S``.
     tool_timeout_s: float
+    # Wall-clock ceiling (seconds) specific to ``index_repository``, which is a
+    # long-running (minutes) operation and must not be governed by the generic
+    # ``tool_timeout_s``. ``<= 0`` disables the timeout. See
+    # ``_DEFAULT_INDEX_TIMEOUT_S``.
+    index_timeout_s: float
 
 
 # ---- Embedding env loader ------------------------------------------------- #
@@ -223,4 +236,5 @@ def load_settings() -> Settings:
         log_json=_env("LOG_JSON", "0") in {"1", "true", "True", "yes"},
         max_file_bytes=_env_int("MAX_FILE_BYTES", _DEFAULT_MAX_FILE_BYTES),
         tool_timeout_s=_env_float("TOOL_TIMEOUT_S", _DEFAULT_TOOL_TIMEOUT_S),
+        index_timeout_s=_env_float("INDEX_TIMEOUT_S", _DEFAULT_INDEX_TIMEOUT_S),
     )

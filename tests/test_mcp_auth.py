@@ -81,7 +81,7 @@ def test_audited_decorator_re_raises_errors() -> None:
 def test_audited_decorator_times_out_slow_tool(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(auth, "_resolve_tool_timeout_s", lambda: 0.05)
+    monkeypatch.setattr(auth, "_resolve_tool_timeout_s", lambda *_: 0.05)
 
     @audited("slow")
     def slow_tool() -> int:
@@ -95,10 +95,39 @@ def test_audited_decorator_times_out_slow_tool(
 def test_audited_decorator_disables_timeout_when_non_positive(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(auth, "_resolve_tool_timeout_s", lambda: 0.0)
+    monkeypatch.setattr(auth, "_resolve_tool_timeout_s", lambda *_: 0.0)
 
     @audited("unbounded")
     def quick_tool() -> int:
         return 42
 
     assert quick_tool() == 42
+
+
+def test_audited_decorator_uses_named_timeout_setting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A tool may opt into a different Settings field for its timeout.
+
+    ``index_repository`` passes ``timeout_setting='index_timeout_s'`` so the
+    generic 20 s cap never applies to long-running indexing.
+    """
+    seen: list[str] = []
+
+    def _fake_resolver(setting_attr: str = "tool_timeout_s") -> float:
+        seen.append(setting_attr)
+        return 0.0  # disabled
+
+    monkeypatch.setattr(auth, "_resolve_tool_timeout_s", _fake_resolver)
+
+    @audited("indexer", timeout_setting="index_timeout_s")
+    def long_tool() -> int:
+        return 7
+
+    assert long_tool() == 7
+    assert seen == ["index_timeout_s"]
+
+
+def test_index_timeout_disabled_by_default() -> None:
+    """The static fallback for index_repository disables the timeout."""
+    assert auth._resolve_tool_timeout_s("index_timeout_s") == 0.0

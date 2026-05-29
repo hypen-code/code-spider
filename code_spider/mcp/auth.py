@@ -24,7 +24,7 @@ from typing import Any, TypeVar
 
 from neo4j import READ_ACCESS, Session
 
-from code_spider.config import _DEFAULT_TOOL_TIMEOUT_S
+from code_spider.config import _DEFAULT_INDEX_TIMEOUT_S, _DEFAULT_TOOL_TIMEOUT_S
 from code_spider.graph.client import Neo4jClient
 from code_spider.logging_setup import get_logger
 from code_spider.observability import METRICS
@@ -41,21 +41,28 @@ _TOOL_EXECUTOR = ThreadPoolExecutor(
     max_workers=8, thread_name_prefix="codespider-tool"
 )
 
+#: Static fallback per ``Settings`` attribute, used when no live
+#: :class:`ServerContext` exists (e.g. tools invoked directly from tests).
+_TIMEOUT_FALLBACKS: dict[str, float] = {
+    "tool_timeout_s": _DEFAULT_TOOL_TIMEOUT_S,
+    "index_timeout_s": _DEFAULT_INDEX_TIMEOUT_S,
+}
 
-def _resolve_tool_timeout_s() -> float:
-    """Return the configured per-tool timeout in seconds.
 
-    Reads ``settings.tool_timeout_s`` from the live :class:`ServerContext`
-    when one exists (the normal server path). Falls back to the static
-    default when the context is not initialised — e.g. tools invoked
-    directly from unit tests — so the decorator never hard-fails.
+def _resolve_tool_timeout_s(setting_attr: str = "tool_timeout_s") -> float:
+    """Return the configured timeout (seconds) for ``setting_attr``.
+
+    Reads the named field off ``settings`` on the live
+    :class:`ServerContext` when one exists (the normal server path). Falls
+    back to the static default when the context is not initialised — e.g.
+    tools invoked directly from unit tests — so the decorator never hard-fails.
     """
     try:
         from code_spider.mcp.context import get_context
 
-        return get_context().settings.tool_timeout_s
+        return float(getattr(get_context().settings, setting_attr))
     except Exception:  # noqa: BLE001 — context optional outside the server
-        return _DEFAULT_TOOL_TIMEOUT_S
+        return _TIMEOUT_FALLBACKS.get(setting_attr, _DEFAULT_TOOL_TIMEOUT_S)
 
 
 # Identifiers we are willing to interpolate into MERGE/MATCH parameters.
@@ -107,15 +114,23 @@ def read_session(client: Neo4jClient) -> Session:
 T = TypeVar("T")
 
 
-def audited(tool_name: str) -> Callable[[Callable[..., T]], Callable[..., T]]:
-    """Decorator: audit-log every tool invocation and record Prometheus timings."""
+def audited(
+    tool_name: str, *, timeout_setting: str = "tool_timeout_s"
+) -> Callable[[Callable[..., T]], Callable[..., T]]:
+    """Decorator: audit-log every tool invocation and record Prometheus timings.
+
+    ``timeout_setting`` names the :class:`~code_spider.config.Settings` field
+    that governs this tool's wall-clock timeout. The generic default is
+    ``tool_timeout_s`` (20 s); long-running tools such as ``index_repository``
+    pass ``"index_timeout_s"`` so they are not killed by the generic cap.
+    """
 
     def decorator(fn: Callable[..., T]) -> Callable[..., T]:
         @wraps(fn)
         def wrapper(*args: Any, **kwargs: Any) -> T:
             started = time.perf_counter()
             audit_kwargs = {k: v for k, v in kwargs.items() if k != "query_text"}
-            timeout_s = _resolve_tool_timeout_s()
+            timeout_s = _resolve_tool_timeout_s(timeout_setting)
             try:
                 if timeout_s and timeout_s > 0:
                     future = _TOOL_EXECUTOR.submit(fn, *args, **kwargs)

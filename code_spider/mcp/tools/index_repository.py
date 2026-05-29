@@ -18,7 +18,7 @@ from code_spider.mcp.context import get_context
 from code_spider.workspace.manifest import load_manifest
 
 
-@audited("index_repository")
+@audited("index_repository", timeout_setting="index_timeout_s")
 def index_repository(
     workspace_id: str,
     repo: str | None = None,
