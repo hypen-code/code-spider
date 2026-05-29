@@ -74,12 +74,82 @@ class Neo4jSettings:
 
 
 @dataclass(frozen=True, slots=True)
+class EmbeddingSettings:
+    """Embedding-provider configuration sourced from ``CODE_SPIDER_EMBED_*``.
+
+    ``provider`` chooses the backend (``sentence-transformers`` is the default
+    local model; ``litellm`` routes through the LiteLLM SDK to any supported
+    cloud provider; ``hash`` is the deterministic test/offline provider).
+    All other fields are forwarded to the relevant adapter — most are only
+    meaningful for ``litellm``.
+    """
+
+    provider: str
+    model: str | None
+    dim: int
+    batch_size: int
+    api_base: str | None
+    api_key: str | None
+    timeout_s: float
+    max_retries: int
+
+
+@dataclass(frozen=True, slots=True)
 class Settings:
     neo4j: Neo4jSettings
+    embedding: EmbeddingSettings
     manifest_path: Path
     checkout_root: Path
     log_level: str
     log_json: bool
+
+
+# ---- Embedding env loader ------------------------------------------------- #
+
+
+_DEFAULT_EMBED_DIM = 384  # matches sentence-transformers/all-MiniLM-L6-v2
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = _env(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        return int(raw)
+    except ValueError as exc:
+        raise RuntimeError(
+            f"CODE_SPIDER_{name} must be an integer, got {raw!r}"
+        ) from exc
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = _env(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        return float(raw)
+    except ValueError as exc:
+        raise RuntimeError(
+            f"CODE_SPIDER_{name} must be a float, got {raw!r}"
+        ) from exc
+
+
+def _load_embedding_settings() -> EmbeddingSettings:
+    """Read every ``CODE_SPIDER_EMBED_*`` knob with safe defaults."""
+    raw_provider = _env("EMBED_PROVIDER", "sentence-transformers") or "sentence-transformers"
+    return EmbeddingSettings(
+        provider=raw_provider.strip(),
+        model=_env("EMBED_MODEL"),
+        dim=_env_int("EMBED_DIM", _DEFAULT_EMBED_DIM),
+        batch_size=_env_int("EMBED_BATCH_SIZE", 64),
+        api_base=_env("EMBED_API_BASE"),
+        # Generic ``CODE_SPIDER_EMBED_API_KEY`` overrides; otherwise LiteLLM
+        # itself picks the right provider-specific env var (OPENAI_API_KEY,
+        # VOYAGE_API_KEY, COHERE_API_KEY, OPENROUTER_API_KEY, ...).
+        api_key=_env("EMBED_API_KEY"),
+        timeout_s=_env_float("EMBED_TIMEOUT_S", 30.0),
+        max_retries=_env_int("EMBED_MAX_RETRIES", 3),
+    )
 
 
 def load_settings() -> Settings:
@@ -92,6 +162,7 @@ def load_settings() -> Settings:
     )
     return Settings(
         neo4j=neo4j,
+        embedding=_load_embedding_settings(),
         manifest_path=Path(_env_required("MANIFEST_PATH", "./workspaces.yaml")).resolve(),
         checkout_root=Path(_env_required("CHECKOUT_ROOT", "./checkouts")).resolve(),
         log_level=_env_required("LOG_LEVEL", "INFO").upper(),

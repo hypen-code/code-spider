@@ -173,10 +173,14 @@ def index_workspace(
     with stage_timer("chunk", workspace.id):
         chunker_stats = _chunk_workspace(bundle=bundle)
     if embed_provider not in (None, "none", "off"):
-        provider = _resolve_embedding_provider(embed_provider)
+        provider = _resolve_embedding_provider(embed_provider, settings=settings)
         if provider is not None:
             with stage_timer("embed", workspace.id):
-                _embed_workspace(bundle=bundle, provider=provider)
+                _embed_workspace(
+                    bundle=bundle,
+                    provider=provider,
+                    expected_dim=settings.embedding.dim,
+                )
 
     # 9. Write.
     write_started = time.perf_counter()
@@ -425,28 +429,48 @@ def _read_source_for(pr: ParseResult, f: FileRecord) -> bytes:
 _SOURCE_CACHE: dict[tuple[str, str], bytes] = {}
 
 
-def _resolve_embedding_provider(name: str | None) -> EmbeddingProvider | None:
-    """Resolve a provider, gracefully degrading if the model is unavailable."""
+def _resolve_embedding_provider(
+    name: str | None, *, settings: Settings | None = None
+) -> EmbeddingProvider | None:
+    """Resolve a provider, gracefully degrading if the model is unavailable.
+
+    Resolution rules:
+
+    * ``name in (None, "auto")`` reads ``settings.embedding.provider`` (which
+      itself comes from ``CODE_SPIDER_EMBED_PROVIDER``, default
+      ``sentence-transformers``). The CLI flag is left at ``auto`` so the
+      env-driven default takes effect; an explicit flag value always wins.
+    * Any other ``name`` is resolved directly from the registry. For
+      ``"litellm"`` the settings bundle is required so the LiteLLM adapter
+      can read the configured model / API base / etc.
+    """
+    embed_settings = settings.embedding if settings is not None else None
+
     if name in (None, "auto"):
-        try:
-            return get_embedding_provider("sentence-transformers")
-        except (ImportError, KeyError) as exc:
-            _log.warning(
-                "sentence-transformers unavailable; chunks will be persisted "
-                "without embeddings (vector search disabled). Install with: "
-                "pip install 'code-spider[embedding]'",
-                error=str(exc),
-            )
-            return None
+        target = embed_settings.provider if embed_settings else "sentence-transformers"
+    else:
+        target = name
+
     try:
-        return get_embedding_provider(name)
-    except KeyError as exc:
-        _log.error("unknown embedding provider", name=name, error=str(exc))
+        return get_embedding_provider(target, settings=embed_settings)
+    except ImportError as exc:
+        _log.warning(
+            "embedding provider unavailable; chunks will be persisted without "
+            "embeddings (vector search disabled).",
+            provider=target,
+            error=str(exc),
+        )
+        return None
+    except (KeyError, ValueError) as exc:
+        _log.error("could not resolve embedding provider", name=target, error=str(exc))
         return None
 
 
 def _embed_workspace(
-    *, bundle: WorkspaceParseBundle, provider: EmbeddingProvider
+    *,
+    bundle: WorkspaceParseBundle,
+    provider: EmbeddingProvider,
+    expected_dim: int | None = None,
 ) -> None:
     """Compute embeddings for every chunk in the bundle."""
     pairs: list[tuple[int, int, int]] = []  # (repo_idx, file_idx, chunk_idx)
@@ -458,6 +482,18 @@ def _embed_workspace(
                 texts.append(c.text)
     if not texts:
         return
+
+    # Fail fast on dim mismatch so an operator who flipped CODE_SPIDER_EMBED_*
+    # without re-migrating gets a clear actionable error instead of a
+    # confusing Neo4j vector-index rejection downstream.
+    if expected_dim is not None and provider.dim != expected_dim:
+        raise RuntimeError(
+            f"embedding provider '{provider.name}' reports dim={provider.dim} "
+            f"but CODE_SPIDER_EMBED_DIM={expected_dim}. Re-run "
+            "`code-spider migrate` after updating CODE_SPIDER_EMBED_DIM to "
+            "match your chosen model (drop the existing chunk_embedding index "
+            "first)."
+        )
 
     vectors = provider.embed_batch(texts)
     if len(vectors) != len(pairs):

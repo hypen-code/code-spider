@@ -47,7 +47,7 @@ workspaces.yaml --> CI indexer ----> Neo4j 5.x Community
 | Call resolution | Tree-sitter + 6-strategy heuristic cascade |
 | Agent interface | MCP server only |
 | Workspace model | Explicit `workspaces.yaml` manifest |
-| Embedding model | Local `sentence-transformers` in-process |
+| Embedding model | Local `sentence-transformers` by default; optional LiteLLM-backed external models (Voyage, OpenAI, Cohere, OpenRouter) via `.env` |
 | Snippet retrieval | Indexer-managed shared filesystem keyed by commit SHA |
 
 ## Quickstart for developers (consume an existing central graph)
@@ -136,6 +136,51 @@ code-spider index --workspace demo --incremental --embed auto
 # Prometheus scraping
 curl http://localhost:9464/metrics | grep code_spider_
 ```
+
+### 6a. External embedding models (LiteLLM)
+
+The default `sentence-transformers/all-MiniLM-L6-v2` runs locally and needs no
+API key. For production-grade code retrieval quality you can switch to a
+hosted model via the [LiteLLM](https://docs.litellm.ai/) SDK without touching
+any code:
+
+```bash
+pip install -e ".[litellm]"        # adds the litellm dependency
+```
+
+Pick one of the recommended models in `.env`:
+
+| Model | Dim | Strengths | Env vars |
+|---|---|---|---|
+| **`voyage/voyage-code-3`** *(recommended for code)* | 1024 | Tuned on source code; tops code-retrieval benchmarks | `VOYAGE_API_KEY` |
+| `openai/text-embedding-3-small` | 1536 | Cheap, widely available, strong general baseline | `OPENAI_API_KEY` |
+| `cohere/embed-multilingual-v3.0` | 1024 | Multilingual code + prose | `COHERE_API_KEY` |
+| OpenRouter (OpenAI-compatible) | varies | Single key, many backends *(verify the chosen route exposes /embeddings)* | `CODE_SPIDER_EMBED_API_BASE`, `CODE_SPIDER_EMBED_API_KEY` |
+
+`.env` example for Voyage:
+
+```dotenv
+CODE_SPIDER_EMBED_PROVIDER=litellm
+CODE_SPIDER_EMBED_MODEL=voyage/voyage-code-3
+CODE_SPIDER_EMBED_DIM=1024
+VOYAGE_API_KEY=...
+```
+
+Then re-create the vector index at the new dimension and reindex:
+
+```bash
+code-spider migrate                                       # auto-recreates index at CODE_SPIDER_EMBED_DIM
+code-spider index --workspace demo                        # picks up litellm via .env
+```
+
+`migrate` auto-detects when `CODE_SPIDER_EMBED_DIM` differs from the
+existing `chunk_embedding` index and drops + recreates the index at the
+new dimension. **This deletes every existing chunk embedding**, so you
+must reindex affected workspaces afterwards (you would need to anyway —
+vectors from one model can't be compared to vectors from another).
+
+Precedence: an explicit `--embed <name>` flag always wins; `--embed auto`
+(the default) reads `CODE_SPIDER_EMBED_PROVIDER`.
 
 ### 7. Recommended security model for developers
 

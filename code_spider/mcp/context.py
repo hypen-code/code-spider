@@ -52,7 +52,7 @@ def initialize(
     client = Neo4jClient(s.neo4j)
     client.verify()
     vector = Neo4jVectorBackend(client)
-    embedder = _resolve_embedder(embed_provider)
+    embedder = _resolve_embedder(embed_provider, settings=s)
     _CONTEXT = ServerContext(
         settings=s,
         neo4j=client,
@@ -82,15 +82,22 @@ def shutdown() -> None:
         _CONTEXT = None
 
 
-def _resolve_embedder(name: str) -> EmbeddingProvider:
-    if name in ("auto", "sentence-transformers"):
-        try:
-            return get_embedding_provider("sentence-transformers")
-        except (ImportError, KeyError):
-            _log.warning(
-                "sentence-transformers unavailable; MCP server falling back to "
-                "deterministic hash embeddings (semantic_code_search quality "
-                "will be poor). Install with: pip install 'code-spider[embedding]'"
-            )
-            return get_embedding_provider("hash")
-    return get_embedding_provider(name)
+def _resolve_embedder(name: str, *, settings: Settings) -> EmbeddingProvider:
+    """Resolve the embedding provider for the MCP server.
+
+    ``name == "auto"`` reads ``CODE_SPIDER_EMBED_PROVIDER`` (default
+    ``sentence-transformers``) so the operator can switch providers without
+    editing MCP launch arguments. Explicit CLI values still win.
+    """
+    target = settings.embedding.provider if name == "auto" else name
+    try:
+        return get_embedding_provider(target, settings=settings.embedding)
+    except (ImportError, KeyError, ValueError) as exc:
+        _log.warning(
+            "embedding provider unavailable; MCP server falling back to "
+            "deterministic hash embeddings (semantic_code_search quality "
+            "will be poor).",
+            requested=target,
+            error=str(exc),
+        )
+        return get_embedding_provider("hash")

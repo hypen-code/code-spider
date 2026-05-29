@@ -4,16 +4,21 @@ The default production provider is :class:`SentenceTransformerProvider`
 (see :mod:`code_spider.embedding.st_provider`); it loads on demand because
 ``sentence-transformers`` is an optional install.
 
-Adding a new provider (Cohere / OpenAI / etc.): implement
-:class:`EmbeddingProvider` and register it via
-:func:`register_embedding_provider`.
+External cloud providers (Voyage, OpenAI, Cohere, …) are reached via the
+LiteLLM SDK; see :class:`LiteLLMEmbeddingProvider`.
+
+Adding a new provider: implement :class:`EmbeddingProvider` and register
+it via :func:`register_embedding_provider`.
 """
 
 from __future__ import annotations
 
 import hashlib
 import math
-from typing import Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
+
+if TYPE_CHECKING:  # pragma: no cover
+    from code_spider.config import EmbeddingSettings
 
 
 @runtime_checkable
@@ -33,21 +38,46 @@ def register_embedding_provider(provider: EmbeddingProvider) -> None:
     _REGISTRY[provider.name] = provider
 
 
-def get_embedding_provider(name: str = "sentence-transformers") -> EmbeddingProvider:
+def clear_registry() -> None:
+    """Drop every cached provider. Used by tests that rebuild from env."""
+    _REGISTRY.clear()
+
+
+def get_embedding_provider(
+    name: str = "sentence-transformers",
+    *,
+    settings: EmbeddingSettings | None = None,
+) -> EmbeddingProvider:
+    """Resolve a provider by name, optionally passing a settings bundle.
+
+    The ``settings`` argument is only consulted for providers that need
+    runtime configuration (currently just ``"litellm"``). For other
+    providers it is ignored.
+    """
     if name not in _REGISTRY:
-        _lazy_load(name)
+        _lazy_load(name, settings=settings)
     if name not in _REGISTRY:
         raise KeyError(f"no embedding provider registered for '{name}'")
     return _REGISTRY[name]
 
 
-def _lazy_load(name: str) -> None:
+def _lazy_load(name: str, *, settings: EmbeddingSettings | None = None) -> None:
     if name == "sentence-transformers":
         from code_spider.embedding.st_provider import SentenceTransformerProvider
 
         register_embedding_provider(SentenceTransformerProvider())
     elif name == "hash":
         register_embedding_provider(HashEmbeddingProvider())
+    elif name == "litellm":
+        if settings is None:
+            # Fall back to env-driven settings so callers that don't have a
+            # ``Settings`` instance still work (e.g. tests, ad-hoc scripts).
+            from code_spider.config import _load_embedding_settings
+
+            settings = _load_embedding_settings()
+        from code_spider.embedding.litellm_provider import LiteLLMEmbeddingProvider
+
+        register_embedding_provider(LiteLLMEmbeddingProvider(settings))
 
 
 class HashEmbeddingProvider:

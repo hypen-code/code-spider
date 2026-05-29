@@ -65,12 +65,21 @@ def main(
 
 @app.command()
 def migrate() -> None:
-    """Apply Neo4j schema (constraints, fulltext + vector indexes). Idempotent."""
+    """Apply Neo4j schema (constraints, fulltext + vector indexes).
+
+    Idempotent. If ``CODE_SPIDER_EMBED_DIM`` has changed since the last run,
+    the ``chunk_embedding`` vector index is dropped and recreated at the new
+    dimension — this deletes all existing chunk embeddings, so reindex
+    affected workspaces afterwards.
+    """
     settings = _settings_or_exit()
     with Neo4jClient(settings.neo4j) as client:
         client.verify()
-        apply_schema(client)
-    console.print("[green]Schema applied.[/green]")
+        apply_schema(client, embedding_dim=settings.embedding.dim)
+    console.print(
+        f"[green]Schema applied.[/green] "
+        f"[dim](vector dim={settings.embedding.dim})[/dim]"
+    )
 
 
 @app.command()
@@ -83,7 +92,11 @@ def index(
     embed: str = typer.Option(
         "auto",
         "--embed",
-        help="Embedding provider: auto | sentence-transformers | hash | none.",
+        help=(
+            "Embedding provider: auto | sentence-transformers | litellm | hash | none. "
+            "'auto' reads CODE_SPIDER_EMBED_PROVIDER (default: sentence-transformers). "
+            "Use 'litellm' with CODE_SPIDER_EMBED_MODEL set (e.g. voyage/voyage-code-3)."
+        ),
     ),
     incremental: bool = typer.Option(
         False,
@@ -166,7 +179,11 @@ def serve(
     embed: str = typer.Option(
         "auto",
         "--embed",
-        help="Embedding provider for semantic_code_search: auto | sentence-transformers | hash.",
+        help=(
+            "Embedding provider for semantic_code_search: "
+            "auto | sentence-transformers | litellm | hash. "
+            "'auto' reads CODE_SPIDER_EMBED_PROVIDER."
+        ),
     ),
 ) -> None:
     """Start the MCP server (JSON-RPC over stdio)."""
