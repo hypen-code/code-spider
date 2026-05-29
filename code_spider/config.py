@@ -24,6 +24,20 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
+#: Default ceiling for per-input embedding text in characters. Tuned just
+#: below the 131_072-char cap shared by Voyage / Qwen-3 / OpenAI's larger
+#: context models so we leave ~10 KB of safety overhead.
+_DEFAULT_MAX_INPUT_CHARS = 120_000
+
+#: Default ceiling for files we even attempt to parse / chunk / embed.
+#: Files bigger than this are almost always auto-generated assets (minified
+#: bundles, vendored libraries, lockfiles, JSON dumps, package manifests)
+#: whose semantic value for code intelligence is near zero, and whose chunks
+#: blow up the embedding bill and memory budget. 1 MiB strikes a balance:
+#: long enough to keep all real source files; short enough to keep the
+#: indexer well under 4 GiB peak resident on a typical small CI runner.
+_DEFAULT_MAX_FILE_BYTES = 1_048_576  # 1 MiB
+
 
 def user_config_path() -> Path:
     """Return the user-global config-env path (does not have to exist)."""
@@ -74,12 +88,111 @@ class Neo4jSettings:
 
 
 @dataclass(frozen=True, slots=True)
+class EmbeddingSettings:
+    """Embedding-provider configuration sourced from ``CODE_SPIDER_EMBED_*``.
+
+    ``provider`` chooses the backend (``sentence-transformers`` is the default
+    local model; ``litellm`` routes through the LiteLLM SDK to any supported
+    cloud provider; ``hash`` is the deterministic test/offline provider).
+    All other fields are forwarded to the relevant adapter — most are only
+    meaningful for ``litellm``.
+    """
+
+    provider: str
+    model: str | None
+    dim: int
+    batch_size: int
+    api_base: str | None
+    api_key: str | None
+    timeout_s: float
+    max_retries: int
+    # Per-input character cap. Most hosted embedding models reject any single
+    # input longer than ~131_072 characters (Qwen-3, Voyage, OpenAI's larger
+    # context models all sit in that range). We default to 120_000 to leave
+    # headroom and pre-truncate anything longer at the provider boundary so a
+    # single huge auto-generated or minified file can't crash the whole
+    # workspace embed. Override with ``CODE_SPIDER_EMBED_MAX_INPUT_CHARS``.
+    max_input_chars: int
+    # Number of concurrent embedding sub-batches dispatched per repo. The
+    # embedding stage is I/O-bound (network calls to the provider), so a
+    # thread pool — not a process pool — is the right primitive. The default
+    # is ``min(os.cpu_count() or 2, 4)``: enough parallelism to saturate a
+    # modest upstream rate budget without thrashing free-tier providers, and
+    # well-sized for the 2 vCPU / 4 GiB target box. Override with
+    # ``CODE_SPIDER_EMBED_WORKERS``.
+    workers: int
+
+
+@dataclass(frozen=True, slots=True)
 class Settings:
     neo4j: Neo4jSettings
+    embedding: EmbeddingSettings
     manifest_path: Path
     checkout_root: Path
     log_level: str
     log_json: bool
+    # Hard ceiling on file size considered for parse/chunk/embed. Files
+    # larger than this are skipped at the walker with a counter + warning.
+    # See ``_DEFAULT_MAX_FILE_BYTES`` for the rationale.
+    max_file_bytes: int
+
+
+# ---- Embedding env loader ------------------------------------------------- #
+
+
+_DEFAULT_EMBED_DIM = 384  # matches sentence-transformers/all-MiniLM-L6-v2
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = _env(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        return int(raw)
+    except ValueError as exc:
+        raise RuntimeError(f"CODE_SPIDER_{name} must be an integer, got {raw!r}") from exc
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = _env(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        return float(raw)
+    except ValueError as exc:
+        raise RuntimeError(f"CODE_SPIDER_{name} must be a float, got {raw!r}") from exc
+
+
+def _load_embedding_settings() -> EmbeddingSettings:
+    """Read every ``CODE_SPIDER_EMBED_*`` knob with safe defaults."""
+    raw_provider = _env("EMBED_PROVIDER", "sentence-transformers") or "sentence-transformers"
+    return EmbeddingSettings(
+        provider=raw_provider.strip(),
+        model=_env("EMBED_MODEL"),
+        dim=_env_int("EMBED_DIM", _DEFAULT_EMBED_DIM),
+        batch_size=_env_int("EMBED_BATCH_SIZE", 64),
+        api_base=_env("EMBED_API_BASE"),
+        # Generic ``CODE_SPIDER_EMBED_API_KEY`` overrides; otherwise LiteLLM
+        # itself picks the right provider-specific env var (OPENAI_API_KEY,
+        # VOYAGE_API_KEY, COHERE_API_KEY, OPENROUTER_API_KEY, ...).
+        api_key=_env("EMBED_API_KEY"),
+        timeout_s=_env_float("EMBED_TIMEOUT_S", 30.0),
+        max_retries=_env_int("EMBED_MAX_RETRIES", 3),
+        max_input_chars=_env_int("EMBED_MAX_INPUT_CHARS", _DEFAULT_MAX_INPUT_CHARS),
+        workers=_env_int("EMBED_WORKERS", _default_workers()),
+    )
+
+
+def _default_workers() -> int:
+    """Default embedding concurrency: ``min(cpu_count, 4)`` (min 1).
+
+    Capped at 4 so we don't hammer free-tier embedding endpoints on bigger
+    boxes; tunable via ``CODE_SPIDER_EMBED_WORKERS``. We pick 4 (not 8) as
+    the upper bound because the 2-vCPU / 4 GiB target box can't usefully
+    parallelise further, and most free-tier API quotas top out around there.
+    """
+    cpu = os.cpu_count() or 2
+    return max(1, min(cpu, 4))
 
 
 def load_settings() -> Settings:
@@ -92,8 +205,10 @@ def load_settings() -> Settings:
     )
     return Settings(
         neo4j=neo4j,
+        embedding=_load_embedding_settings(),
         manifest_path=Path(_env_required("MANIFEST_PATH", "./workspaces.yaml")).resolve(),
         checkout_root=Path(_env_required("CHECKOUT_ROOT", "./checkouts")).resolve(),
         log_level=_env_required("LOG_LEVEL", "INFO").upper(),
         log_json=_env("LOG_JSON", "0") in {"1", "true", "True", "yes"},
+        max_file_bytes=_env_int("MAX_FILE_BYTES", _DEFAULT_MAX_FILE_BYTES),
     )

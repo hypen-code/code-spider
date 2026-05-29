@@ -70,12 +70,27 @@ def test_phase0_index_writes_expected_graph(
         ],
     )
 
+    from code_spider.config import EmbeddingSettings
+
     settings = Settings(
         neo4j=neo4j_settings,
+        embedding=EmbeddingSettings(
+            provider="hash",
+            model=None,
+            dim=384,
+            batch_size=64,
+            api_base=None,
+            api_key=None,
+            timeout_s=30.0,
+            max_retries=3,
+            max_input_chars=120_000,
+            workers=1,
+        ),
         manifest_path=tmp_path / "workspaces.yaml",
         checkout_root=tmp_path / "checkouts",
         log_level="WARNING",
         log_json=False,
+        max_file_bytes=1_048_576,
     )
 
     with Neo4jClient(neo4j_settings) as client:

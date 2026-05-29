@@ -46,6 +46,12 @@ embedding = [
     "sentence-transformers>=3.0",
     "torch>=2.3",
 ]
+# LiteLLM-backed external embeddings (Voyage, OpenAI, Cohere, OpenRouter, ...).
+# Kept optional so installs that only use the local sentence-transformers
+# provider stay slim. ``litellm`` itself pulls a moderate dep tree.
+litellm = [
+    "litellm>=1.40",
+]
 dev = [
     "pytest>=8.2",
     "pytest-cov>=5.0",
@@ -55,7 +61,7 @@ dev = [
     "types-PyYAML",
 ]
 all = [
-    "code-spider[embedding,dev]",
+    "code-spider[embedding,litellm,dev]",
 ]
 
 [project.scripts]
@@ -99,6 +105,7 @@ ignore = [
 # Optional-dep guard + lazy registry pattern.
 "code_spider/embedding/provider.py" = ["PLC0415"]
 "code_spider/embedding/st_provider.py" = ["PLC0415"]
+"code_spider/embedding/litellm_provider.py" = ["PLC0415"]
 # `index_workspace` orchestrates many stages; splitting it would hurt readability.
 "code_spider/indexer.py" = ["PLR0915"]
 # Module-level singleton for the MCP server context is intentional.

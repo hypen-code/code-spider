@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from textwrap import dedent
 
-from code_spider.messaging.kafka_matcher import match_kafka_flows
+from code_spider.messaging.kafka_matcher import count_repo_topics, match_kafka_flows
 from code_spider.parser import get_adapter
 from code_spider.routes.matcher import match_http_flows
 from code_spider.symbols.model import ParseResult, WorkspaceParseBundle
@@ -16,9 +16,7 @@ def _parse(source: str, path: str, lang: str = "python"):
 
 def _bundle(*files_per_repo: tuple[str, list]) -> WorkspaceParseBundle:
     """Build a WorkspaceParseBundle from ``(repo_name, [FileRecord, ...])`` pairs."""
-    bundle = WorkspaceParseBundle(
-        workspace_id="ws", workspace_name="Ws", manifest_sha="x"
-    )
+    bundle = WorkspaceParseBundle(workspace_id="ws", workspace_name="Ws", manifest_sha="x")
     for repo_name, files in files_per_repo:
         bundle.repos.append(
             ParseResult(
@@ -141,3 +139,92 @@ def test_kafka_flow_skips_dynamic_topics() -> None:
     bundle = _bundle(("svc", [producer, consumer]))
     edges = match_kafka_flows(bundle)
     assert not edges, "dynamic topics should never form a KAFKA_FLOW edge"
+
+
+# --------------------------------------------------------------------------- #
+# count_repo_topics — the developer-facing "does this repo use Kafka?" signal #
+# --------------------------------------------------------------------------- #
+
+
+def _pr(repo_name: str, *files) -> ParseResult:
+    return ParseResult(workspace_id="ws", repo_name=repo_name, commit_sha="sha", files=list(files))
+
+
+def test_count_repo_topics_returns_zero_for_pure_false_positives() -> None:
+    """The whole point of the column change: a service that never imports
+    Kafka but happens to call ``.send`` / ``.subscribe`` on HTTP clients
+    and observer patterns must report **zero** Kafka topics.
+
+    The chiron repo in the user's screenshots had 38 such call-sites; with
+    the new logic that column collapses to 0 because every topic argument
+    is a variable (``<dynamic>``).
+    """
+    fr = _parse(
+        """
+        import requests
+
+        def fetch(req):
+            session = requests.Session()
+            session.send(req)         # heuristic matches .send → DYNAMIC
+
+        def watch(observable, handler):
+            observable.subscribe(handler)  # matches .subscribe → DYNAMIC
+
+        def push(pipe, message):
+            pipe.send(message)        # multiprocessing.Pipe → DYNAMIC
+        """,
+        "svc/noise.py",
+    )
+    # The heuristic must still have matched call-sites (sanity-check our
+    # premise) — but every one of them is a dynamic topic.
+    assert fr.kafka_producers or fr.kafka_consumers, (
+        "test invariant: the heuristic should fire on these idioms; if it "
+        "stops firing, this regression test loses its meaning."
+    )
+    assert all(p.topic_name == "<dynamic>" for p in fr.kafka_producers)
+    assert all(c.topic_name == "<dynamic>" for c in fr.kafka_consumers)
+
+    assert count_repo_topics(_pr("noisy", fr)) == 0
+
+
+def test_count_repo_topics_counts_distinct_literal_topics() -> None:
+    """Real Kafka usage with string-literal topics is counted correctly."""
+    fr = _parse(
+        """
+        from kafka import KafkaProducer, KafkaConsumer
+
+        def publish():
+            p = KafkaProducer()
+            p.send('orders', b'')
+            p.send('payments', b'')
+
+        def listen():
+            c = KafkaConsumer('orders')   # overlaps with producer topic
+            c.subscribe(['audit-log'])    # new topic via subscribe(list)
+        """,
+        "svc/kafka_io.py",
+    )
+    # Expected distinct non-dynamic topics: {orders, payments, audit-log} = 3
+    # (orders counted once even though it appears as both producer + consumer).
+    assert count_repo_topics(_pr("real", fr)) == 3
+
+
+def test_count_repo_topics_ignores_dynamic_among_real() -> None:
+    """A repo with a mix of real and dynamic topics counts only the reals."""
+    fr = _parse(
+        """
+        from kafka import KafkaProducer
+
+        def emit(topic_from_config):
+            p = KafkaProducer()
+            p.send('telemetry', b'')          # real
+            p.send(topic_from_config, b'')    # dynamic — ignored
+        """,
+        "svc/kafka_emit.py",
+    )
+    assert count_repo_topics(_pr("mixed", fr)) == 1
+
+
+def test_count_repo_topics_zero_for_empty_repo() -> None:
+    """No files → 0 (no crash, no divide-by-zero in callers)."""
+    assert count_repo_topics(_pr("empty")) == 0
