@@ -1,0 +1,33 @@
+## Code Spider workspace manifest.
+## Copy to `workspaces.yaml` and edit. `code-spider index` reads this file.
+##
+## Each workspace defines a logical boundary for cross-service edge resolution
+## (HTTP_FLOW, KAFKA_FLOW). Repos in different workspaces never share edges.
+
+version: 1
+
+workspaces:
+  - id: demo
+    name: Demo Workspace
+    repos:
+      # Local-path repo (fast for dev) - use `path` instead of `url`.
+      - name: code-spider-self
+        path: .
+        branch: main
+        languages: [python]
+
+  - id: payments-platform
+    name: Payments Platform
+    repos:
+      - name: payments-api
+        url: git@github.com:acme/payments-api.git
+        branch: main
+        languages: [python]
+      - name: payments-web
+        url: git@github.com:acme/payments-web.git
+        branch: main
+        languages: [typescript, javascript]
+      - name: payments-shared
+        url: git@github.com:acme/payments-shared.git
+        branch: main
+        languages: [python]

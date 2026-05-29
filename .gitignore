@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+*.egg
+.eggs/
+*.pyc
+
+# Virtualenv
+.venv/
+venv/
+env/
+
+# Type / test caches
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Workspace runtime artefacts
+checkouts/
+.code-spider/
+workspaces.yaml
+
+# Neo4j local data
+neo4j_data/
+neo4j_logs/
+neo4j_plugins/
+neo4j_import/
+
+# OS
+.DS_Store
+Thumbs.db
+.env
